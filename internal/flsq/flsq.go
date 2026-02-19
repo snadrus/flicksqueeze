@@ -3,12 +3,12 @@ package flsq
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"os"
 	"path/filepath"
 	"runtime"
-	"strconv"
 	"strings"
 	"time"
 
@@ -37,34 +37,13 @@ type Config struct {
 // (e.g. pressing Enter) signals a graceful stop. Returns a channel that
 // receives when the user requests quit.
 func ListenForQuit() <-chan struct{} {
-	ch := make(chan struct{}, 1)
+	ch := make(chan struct{})
 	go func() {
 		r := bufio.NewReader(os.Stdin)
-		for {
-			_, err := r.ReadString('\n')
-			if err != nil {
-				return
-			}
-			select {
-			case ch <- struct{}{}:
-				log.Println(">>> graceful stop requested — will finish current encode then exit")
-			default:
-			}
-		}
+		r.ReadString('\n')
+		close(ch)
 	}()
 	return ch
-}
-
-func quitRequested(ch <-chan struct{}) bool {
-	if ch == nil {
-		return false
-	}
-	select {
-	case <-ch:
-		return true
-	default:
-		return false
-	}
 }
 
 // Run is the main scan-convert-validate loop. It blocks until the context is
@@ -75,6 +54,20 @@ func Run(ctx context.Context, cfg Config) error {
 	enc := ffmpeglib.New()
 	if err := enc.EnsureAvailable(ctx); err != nil {
 		return err
+	}
+
+	// Wrap context so Enter-quit cancels the scanner and sleep immediately.
+	ctx, cancelAll := context.WithCancel(ctx)
+	defer cancelAll()
+	if cfg.QuitCh != nil {
+		go func() {
+			select {
+			case <-cfg.QuitCh:
+				log.Println(">>> graceful stop requested — will finish current encode then exit")
+				cancelAll()
+			case <-ctx.Done():
+			}
+		}()
 	}
 
 	hw := enc.DetectHW(ctx)
@@ -95,7 +88,7 @@ func Run(ctx context.Context, cfg Config) error {
 
 		processed := 0
 		for c := range ch {
-			if ctx.Err() != nil || quitRequested(cfg.QuitCh) {
+			if ctx.Err() != nil {
 				for range ch {
 				}
 				return nil
@@ -106,7 +99,7 @@ func Run(ctx context.Context, cfg Config) error {
 			processCandidate(ctx, enc, c, cfg.RootPath, cfg.NoDelete, hw)
 		}
 
-		if ctx.Err() != nil || quitRequested(cfg.QuitCh) {
+		if ctx.Err() != nil {
 			return nil
 		}
 
@@ -129,6 +122,14 @@ var hevcFirstCodecs = map[string]bool{
 }
 
 func processCandidate(ctx context.Context, enc *ffmpeglib.Encoder, c scanner.Candidate, rootPath string, noDelete bool, hw ffmpeglib.HWCaps) {
+	timeout := encodeTimeoutForSize(c.Size)
+	release, err := acquireLock(c.Path, timeout)
+	if err != nil {
+		log.Printf("skipping %s: %v", c.Path, err)
+		return
+	}
+	defer release()
+
 	outPath := paths.OutputPath(c.Path)
 
 	// --- collision / restart detection ---
@@ -155,9 +156,7 @@ func processCandidate(ctx context.Context, enc *ffmpeglib.Encoder, c scanner.Can
 	// --- choose encoder: HEVC hw (fast) or AV1 sw (small) ---
 	useHEVC := hw.UseHEVCFirst() && hevcFirstCodecs[strings.ToLower(c.Codec)]
 	progress := func(p ffmpeglib.ProgressLine) { fmt.Println(p.Raw) }
-	timeout := encodeTimeoutForSize(c.Size)
 
-	var err error
 	if useHEVC {
 		err = encodeHEVC(ctx, enc, c.Path, outPath, hw, timeout, progress)
 	} else {
@@ -224,7 +223,7 @@ func encodeAV1(ctx context.Context, enc *ffmpeglib.Encoder, inPath, outPath stri
 	_, err := enc.EncodeToAV1SVT(encCtx, inPath, outPath, opts, progress)
 	encCancel()
 
-	if err != nil && ctx.Err() == nil {
+	if err != nil && !errors.Is(err, ffmpeglib.ErrAlreadyAV1) && ctx.Err() == nil {
 		log.Printf("AV1 encode failed (retrying without subtitles): %v", err)
 		_ = os.Remove(outPath)
 		opts.DropSubtitles = true
@@ -236,7 +235,11 @@ func encodeAV1(ctx context.Context, enc *ffmpeglib.Encoder, inPath, outPath stri
 }
 
 func finishConversion(c scanner.Candidate, outPath, rootPath string, noDelete bool, encType string) {
-	outInfo, _ := os.Stat(outPath)
+	outInfo, err := os.Stat(outPath)
+	if err != nil {
+		log.Printf("error: cannot stat output %s: %v", outPath, err)
+		return
+	}
 	outSize := outInfo.Size()
 	saved := c.Size - outSize
 	log.Printf("validated OK [%s]: %s saved (%s -> %s)",
@@ -245,8 +248,10 @@ func finishConversion(c scanner.Candidate, outPath, rootPath string, noDelete bo
 	retireOriginal(c.Path, noDelete)
 
 	finalPath := outPath
-	if strings.Contains(filepath.Base(outPath), paths.AV1TmpTag) {
-		finalPath = strings.Replace(outPath, paths.AV1TmpTag, "", 1)
+	base := filepath.Base(outPath)
+	if strings.Contains(base, paths.AV1TmpTag) {
+		dir := filepath.Dir(outPath)
+		finalPath = filepath.Join(dir, strings.Replace(base, paths.AV1TmpTag, "", 1))
 		if err := os.Rename(outPath, finalPath); err != nil {
 			log.Printf("error: rename %s -> %s failed: %v", outPath, finalPath, err)
 			return
@@ -307,35 +312,6 @@ func encodeTimeoutForSize(fileSize int64) time.Duration {
 	return time.Duration(hours * float64(time.Hour))
 }
 
-// cpuGHz returns the average CPU clock speed in GHz by reading
-// /proc/cpuinfo (Linux). Falls back to baselineGHz on error.
-func cpuGHz() float64 {
-	data, err := os.ReadFile("/proc/cpuinfo")
-	if err != nil {
-		return baselineGHz
-	}
-	var total float64
-	var count int
-	for _, line := range strings.Split(string(data), "\n") {
-		if !strings.HasPrefix(line, "cpu MHz") {
-			continue
-		}
-		parts := strings.SplitN(line, ":", 2)
-		if len(parts) != 2 {
-			continue
-		}
-		mhz, err := strconv.ParseFloat(strings.TrimSpace(parts[1]), 64)
-		if err != nil {
-			continue
-		}
-		total += mhz
-		count++
-	}
-	if count == 0 {
-		return baselineGHz
-	}
-	return (total / float64(count)) / 1000.0
-}
 
 func fmtWaste(score float64) string {
 	const gb = 1024 * 1024 * 1024

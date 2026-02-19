@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io/fs"
 	"log"
+	"os"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -135,6 +136,9 @@ func Scan(ctx context.Context, enc *ffmpeglib.Encoder, rootPath string, out chan
 		if failures[path] {
 			return nil
 		}
+		if isLocked(path) {
+			return nil
+		}
 
 		info, err := d.Info()
 		if err != nil {
@@ -196,8 +200,10 @@ func Scan(ctx context.Context, enc *ffmpeglib.Encoder, rootPath string, out chan
 		log.Printf("scan: index write error: %v", err)
 		writerOK = false
 	}
-	if writerOK {
+	if writerOK && ctx.Err() == nil {
 		finishIndex(tmpPath, writer.n)
+	} else if ctx.Err() != nil {
+		log.Println("scan interrupted, keeping previous index")
 	}
 
 	log.Printf("scan complete: %d conversion candidates evaluated", scanned)
@@ -220,6 +226,17 @@ func flushBest(ctx context.Context, buf *[]Candidate, out chan<- Candidate, n in
 		}
 	}
 	return sent
+}
+
+const lockFreshness = 10 * time.Minute
+
+// isLocked returns true if another instance holds a fresh lock on this file.
+func isLocked(path string) bool {
+	info, err := os.Stat(path + paths.LockSuffix)
+	if err != nil {
+		return false
+	}
+	return time.Since(info.ModTime()) < lockFreshness
 }
 
 // HumanSize returns a human-readable byte size.

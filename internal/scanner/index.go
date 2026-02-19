@@ -9,20 +9,23 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/snadrus/flicksqueeze/internal/paths"
 )
 
 const (
-	indexFile    = ".flicksqueeze.idx"
-	indexTmp     = ".flicksqueeze.idx.tmp"
 	indexVersion = 1
 	indexHeader  = "# flicksqueeze codec index – do not edit | version:"
 )
+
+func indexFile() string { return ".flicksqueeze-" + paths.Hostname() + ".idx" }
+func indexTmp() string  { return ".flicksqueeze-" + paths.Hostname() + ".idx.tmp" }
 
 // pathKey transforms a path so that string comparison matches filepath.WalkDir
 // traversal order. WalkDir descends into subdirectories before processing
 // later siblings, so `/` must sort before every other byte.
 func pathKey(p string) string {
-	return strings.ReplaceAll(p, "/", "\x00")
+	return strings.ReplaceAll(p, string(filepath.Separator), "\x00")
 }
 
 // ---------------- reader (streams old index one entry at a time) ----------------
@@ -163,8 +166,8 @@ func (iw *idxWriter) close() error {
 // installs it as .idx.tmp (the read source), and removes the other.
 // Returns (tmpPath to read, newPath to write).
 func prepareIndex(rootPath string) (tmpPath, newPath string) {
-	newPath = filepath.Join(rootPath, indexFile)
-	tmpPath = filepath.Join(rootPath, indexTmp)
+	newPath = filepath.Join(rootPath, indexFile())
+	tmpPath = filepath.Join(rootPath, indexTmp())
 
 	baseInfo, baseErr := os.Stat(newPath)
 	tmpInfo, tmpErr := os.Stat(tmpPath)

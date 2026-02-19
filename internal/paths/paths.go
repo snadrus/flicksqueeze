@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 )
 
 const (
@@ -12,9 +13,10 @@ const (
 	AV1TmpTag         = ".av1tmp"
 	DeleteMeTag       = "_deleteMe"
 	TmpPrefix         = ".tmp-"
-	MetaComment     = "converted to av1 with flicksqueeze"
-	HEVCMetaComment = "hevc pass by flicksqueeze - av1 pending"
-	TallyFile       = ".flicksqueeze.log"
+	LockSuffix        = ".flsq-lock"
+	MetaComment       = "converted to av1 with flicksqueeze"
+	HEVCMetaComment   = "hevc pass by flicksqueeze - av1 pending"
+	TallyFile         = ".flicksqueeze.log"
 )
 
 // OutputPath computes the conversion output path for an input file.
@@ -42,6 +44,22 @@ func IsWorkFile(basename string) bool {
 // (either AV1 final or HEVC intermediate).
 func IsOurComment(comment string) bool {
 	return comment == MetaComment || comment == HEVCMetaComment
+}
+
+var (
+	hostnameOnce sync.Once
+	hostname     string
+)
+
+func Hostname() string {
+	hostnameOnce.Do(func() {
+		h, err := os.Hostname()
+		if err != nil || h == "" {
+			h = "unknown"
+		}
+		hostname = h
+	})
+	return hostname
 }
 
 // OutputExists checks whether the expected output for a conversion

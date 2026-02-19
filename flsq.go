@@ -7,7 +7,6 @@ import (
 	"os"
 	"os/signal"
 	"strings"
-	"syscall"
 
 	"github.com/snadrus/flicksqueeze/internal/flsq"
 )
@@ -39,7 +38,8 @@ func main() {
 
 	cfg.QuitCh = flsq.ListenForQuit()
 
-	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	sigs := append([]os.Signal{os.Interrupt}, extraSignals...)
+	ctx, cancel := signal.NotifyContext(context.Background(), sigs...)
 	defer cancel()
 
 	if err := flsq.Run(ctx, cfg); err != nil {

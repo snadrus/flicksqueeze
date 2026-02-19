@@ -12,8 +12,12 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"syscall"
+
+	"github.com/snadrus/flicksqueeze/internal/paths"
 )
+
+// ErrAlreadyAV1 is returned when SkipIfAlreadyAV1 is set and the input is AV1.
+var ErrAlreadyAV1 = errors.New("input already AV1")
 
 type Encoder struct {
 	FFmpegPath  string // default "ffmpeg"
@@ -85,7 +89,7 @@ func (e *Encoder) EncodeToAV1SVT(ctx context.Context, inPath, outPath string, op
 	if opt.SkipIfAlreadyAV1 {
 		vcodec, err := e.VideoCodec(ctx, inPath)
 		if err == nil && strings.EqualFold(vcodec, "av1") {
-			return nil, fmt.Errorf("skipped: input already AV1 (%s)", inPath)
+			return nil, ErrAlreadyAV1
 		}
 	}
 
@@ -94,7 +98,7 @@ func (e *Encoder) EncodeToAV1SVT(ctx context.Context, inPath, outPath string, op
 	}
 
 	outExt := filepath.Ext(outPath)
-	tmpPath := outPath[:len(outPath)-len(outExt)] + ".tmp-flsq-av1" + outExt
+	tmpPath := outPath[:len(outPath)-len(outExt)] + ".tmp-flsq-av1-" + paths.Hostname() + outExt
 	_ = os.Remove(tmpPath) // clean up stale temp from a previous crash
 
 	// Build ffmpeg args.
@@ -152,16 +156,7 @@ func (e *Encoder) EncodeToAV1SVT(ctx context.Context, inPath, outPath string, op
 
 func runCmdStreaming(ctx context.Context, bin string, args []string, progress func(ProgressLine)) (*RunResult, error) {
 	cmd := exec.CommandContext(ctx, bin, args...)
-	cmd.SysProcAttr = &syscall.SysProcAttr{
-		Pdeathsig: syscall.SIGTERM,
-	}
-
-	// Run ffmpeg at lowest CPU and I/O priority so interactive work
-	// is never starved. We wrap with nice/ionice rather than using
-	// setpriority(2) because SVT-AV1 spawns its own worker threads
-	// and they inherit the nice value from the process, not the parent.
-	cmd.Path, _ = exec.LookPath("nice")
-	cmd.Args = append([]string{"nice", "-n", "19", "ionice", "-c", "3", bin}, args...)
+	configureCmd(cmd, bin, args)
 
 	var stdoutBuf, stderrBuf bytes.Buffer
 	stdoutPipe, err := cmd.StdoutPipe()
@@ -359,7 +354,7 @@ func (e *Encoder) EncodeToHEVCHW(ctx context.Context, inPath, outPath string, pr
 	}
 
 	outExt := filepath.Ext(outPath)
-	tmpPath := outPath[:len(outPath)-len(outExt)] + ".tmp-flsq-hevc" + outExt
+	tmpPath := outPath[:len(outPath)-len(outExt)] + ".tmp-flsq-hevc-" + paths.Hostname() + outExt
 	_ = os.Remove(tmpPath)
 
 	args := append([]string{}, prof.InitArgs...)
@@ -404,9 +399,11 @@ func containerMuxer(container string) string {
 
 func (e *Encoder) ffprobe(ctx context.Context, args ...string) (string, error) {
 	cmd := exec.CommandContext(ctx, e.FFprobePath, args...)
-	b, err := cmd.CombinedOutput()
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	out, err := cmd.Output()
 	if err != nil {
-		return "", fmt.Errorf("ffprobe error: %w: %s", err, string(b))
+		return "", fmt.Errorf("ffprobe error: %w: %s", err, stderr.String())
 	}
-	return string(b), nil
+	return string(out), nil
 }
