@@ -3,14 +3,15 @@ package scanner
 import (
 	"bufio"
 	"fmt"
+	"io"
 	"log"
-	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/snadrus/flicksqueeze/internal/paths"
+	"github.com/snadrus/flicksqueeze/internal/vfs"
 )
 
 const (
@@ -21,17 +22,14 @@ const (
 func indexFile() string { return ".flicksqueeze-" + paths.Hostname() + ".idx" }
 func indexTmp() string  { return ".flicksqueeze-" + paths.Hostname() + ".idx.tmp" }
 
-// pathKey transforms a path so that string comparison matches filepath.WalkDir
-// traversal order. WalkDir descends into subdirectories before processing
-// later siblings, so `/` must sort before every other byte.
 func pathKey(p string) string {
 	return strings.ReplaceAll(p, string(filepath.Separator), "\x00")
 }
 
-// ---------------- reader (streams old index one entry at a time) ----------------
+// ---------------- reader ----------------
 
 type idxReader struct {
-	f       *os.File
+	rc      io.Closer
 	sc      *bufio.Scanner
 	curPath string
 	cur     *idxEntry
@@ -43,32 +41,32 @@ type idxEntry struct {
 	size    int64
 }
 
-func openReader(path string) *idxReader {
-	f, err := os.Open(path)
+func openReader(fsys vfs.FS, path string) *idxReader {
+	rc, err := fsys.Open(path)
 	if err != nil {
 		return &idxReader{}
 	}
 
-	sc := bufio.NewScanner(f)
+	sc := bufio.NewScanner(rc)
 	buf := make([]byte, 0, 64*1024)
 	sc.Buffer(buf, 2*1024*1024)
 
 	if !sc.Scan() {
-		f.Close()
+		rc.Close()
 		return &idxReader{}
 	}
 	parts := strings.SplitN(sc.Text(), "version:", 2)
 	if len(parts) != 2 {
-		f.Close()
+		rc.Close()
 		return &idxReader{}
 	}
 	ver, err := strconv.Atoi(strings.TrimSpace(parts[1]))
 	if err != nil || ver != indexVersion {
-		f.Close()
+		rc.Close()
 		return &idxReader{}
 	}
 
-	r := &idxReader{f: f, sc: sc}
+	r := &idxReader{rc: rc, sc: sc}
 	r.next()
 	return r
 }
@@ -103,10 +101,6 @@ func (r *idxReader) next() {
 	}
 }
 
-// advanceTo skips past reader entries whose path sorts before `path` in walk
-// order. If the reader has an entry for `path` with matching mtime+size it
-// returns the cached codec. The entry is always consumed so the reader stays
-// in sync with the walk regardless of hit/miss.
 func (r *idxReader) advanceTo(path string, modTime time.Time, size int64) (codec string, hit bool) {
 	key := pathKey(path)
 	for r.cur != nil && pathKey(r.curPath) < key {
@@ -124,27 +118,27 @@ func (r *idxReader) advanceTo(path string, modTime time.Time, size int64) (codec
 }
 
 func (r *idxReader) close() {
-	if r.f != nil {
-		r.f.Close()
+	if r.rc != nil {
+		r.rc.Close()
 	}
 }
 
-// ---------------- writer (appends entries to the new index) ----------------
+// ---------------- writer ----------------
 
 type idxWriter struct {
-	f *os.File
-	w *bufio.Writer
-	n int
+	wc io.WriteCloser
+	w  *bufio.Writer
+	n  int
 }
 
-func openWriter(path string) (*idxWriter, error) {
-	f, err := os.Create(path)
+func openWriter(fsys vfs.FS, path string) (*idxWriter, error) {
+	wc, err := fsys.Create(path)
 	if err != nil {
 		return nil, err
 	}
-	w := bufio.NewWriter(f)
+	w := bufio.NewWriter(wc)
 	fmt.Fprintf(w, "%s %d\n", indexHeader, indexVersion)
-	return &idxWriter{f: f, w: w}, nil
+	return &idxWriter{wc: wc, w: w}, nil
 }
 
 func (iw *idxWriter) write(path, codec string, modTime time.Time, size int64) {
@@ -154,46 +148,39 @@ func (iw *idxWriter) write(path, codec string, modTime time.Time, size int64) {
 
 func (iw *idxWriter) close() error {
 	if err := iw.w.Flush(); err != nil {
-		iw.f.Close()
+		iw.wc.Close()
 		return err
 	}
-	return iw.f.Close()
+	return iw.wc.Close()
 }
 
 // ---------------- lifecycle ----------------
 
-// prepareIndex picks whichever of .idx / .idx.tmp is larger (more complete),
-// installs it as .idx.tmp (the read source), and removes the other.
-// Returns (tmpPath to read, newPath to write).
-func prepareIndex(rootPath string) (tmpPath, newPath string) {
+func prepareIndex(fsys vfs.FS, rootPath string) (tmpPath, newPath string) {
 	newPath = filepath.Join(rootPath, indexFile())
 	tmpPath = filepath.Join(rootPath, indexTmp())
 
-	baseInfo, baseErr := os.Stat(newPath)
-	tmpInfo, tmpErr := os.Stat(tmpPath)
+	baseInfo, baseErr := fsys.Stat(newPath)
+	tmpInfo, tmpErr := fsys.Stat(tmpPath)
 
 	switch {
 	case baseErr != nil && tmpErr != nil:
-		// nothing exists
 	case baseErr != nil:
-		// only tmp exists, keep it
 	case tmpErr != nil:
-		// only base exists, rotate to tmp
-		os.Rename(newPath, tmpPath)
+		fsys.Rename(newPath, tmpPath)
 	default:
 		if baseInfo.Size() >= tmpInfo.Size() {
-			os.Remove(tmpPath)
-			os.Rename(newPath, tmpPath)
+			fsys.Remove(tmpPath)
+			fsys.Rename(newPath, tmpPath)
 		} else {
-			os.Remove(newPath)
+			fsys.Remove(newPath)
 		}
 	}
 
 	return tmpPath, newPath
 }
 
-// finishIndex removes the tmp backup after a successful write.
-func finishIndex(tmpPath string, written int) {
-	_ = os.Remove(tmpPath)
+func finishIndex(fsys vfs.FS, tmpPath string, written int) {
+	_ = fsys.Remove(tmpPath)
 	log.Printf("index: saved %d entries", written)
 }

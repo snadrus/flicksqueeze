@@ -16,12 +16,14 @@ import (
 	"github.com/snadrus/flicksqueeze/internal/paths"
 )
 
-// ErrAlreadyAV1 is returned when SkipIfAlreadyAV1 is set and the input is AV1.
 var ErrAlreadyAV1 = errors.New("input already AV1")
 
+type ExecFunc func(ctx context.Context, name string, args ...string) (stdout []byte, stderr []byte, err error)
+
 type Encoder struct {
-	FFmpegPath  string // default "ffmpeg"
-	FFprobePath string // default "ffprobe"
+	FFmpegPath  string
+	FFprobePath string
+	ProbeExec   ExecFunc
 }
 
 func New() *Encoder {
@@ -32,15 +34,15 @@ func New() *Encoder {
 }
 
 type AV1Options struct {
-	CRF         int    // e.g. 28
-	Preset      int    // SVT-AV1 preset, e.g. 5 or 6
-	Threads     int    // 0 = ffmpeg default
-	PixFmt      string // e.g. "yuv420p10le"
-	Container   string // e.g. "mkv" (recommended), or "mp4" (works but pick a modern player stack)
-	MetaComment string // written to the container comment tag for identification
+	CRF         int
+	Preset      int
+	Threads     int
+	PixFmt      string
+	Container   string
+	MetaComment string
 
 	SkipIfAlreadyAV1 bool
-	DropSubtitles    bool // use -sn instead of -c:s copy (fallback for incompatible subs)
+	DropSubtitles    bool
 	ExtraFFmpegArgs  []string
 }
 
@@ -64,13 +66,6 @@ type ProgressLine struct {
 	Raw string
 }
 
-type RunResult struct {
-	Args      []string
-	Stdout    string
-	Stderr    string
-	ExitError error
-}
-
 func (e *Encoder) EnsureAvailable(ctx context.Context) error {
 	for _, bin := range []string{e.FFmpegPath, e.FFprobePath} {
 		cmd := exec.CommandContext(ctx, bin, "-version")
@@ -81,40 +76,35 @@ func (e *Encoder) EnsureAvailable(ctx context.Context) error {
 	return nil
 }
 
-// EncodeToAV1SVT encodes the input file to AV1 (SVT-AV1) into outPath.
-// It writes to a temp file next to outPath and renames on success.
-func (e *Encoder) EncodeToAV1SVT(ctx context.Context, inPath, outPath string, opt AV1Options, progress func(ProgressLine)) (*RunResult, error) {
+func (e *Encoder) EncodeToAV1SVT(ctx context.Context, inPath, outPath string, opt AV1Options, progress func(ProgressLine)) error {
 	opt = opt.withDefaults()
 
 	if opt.SkipIfAlreadyAV1 {
 		vcodec, err := e.VideoCodec(ctx, inPath)
 		if err == nil && strings.EqualFold(vcodec, "av1") {
-			return nil, ErrAlreadyAV1
+			return ErrAlreadyAV1
 		}
 	}
 
 	if err := os.MkdirAll(filepath.Dir(outPath), 0o755); err != nil {
-		return nil, err
+		return err
 	}
 
 	outExt := filepath.Ext(outPath)
 	tmpPath := outPath[:len(outPath)-len(outExt)] + ".tmp-flsq-av1-" + paths.Hostname() + outExt
-	_ = os.Remove(tmpPath) // clean up stale temp from a previous crash
+	_ = os.Remove(tmpPath)
 
-	// Build ffmpeg args.
 	args := []string{
+		"-nostdin",
 		"-hide_banner",
 		"-y",
 		"-i", inPath,
-
 		"-map", "0",
-
 		"-c:v", "libsvtav1",
 		"-crf", strconv.Itoa(opt.CRF),
 		"-preset", strconv.Itoa(opt.Preset),
 		"-pix_fmt", opt.PixFmt,
 		"-g", "240",
-
 		"-c:a", "copy",
 	}
 
@@ -135,64 +125,54 @@ func (e *Encoder) EncodeToAV1SVT(ctx context.Context, inPath, outPath string, op
 	}
 
 	args = append(args, opt.ExtraFFmpegArgs...)
-
 	args = append(args, tmpPath)
 
-	res, err := runCmdStreaming(ctx, e.FFmpegPath, args, progress)
-	if err != nil {
+	if err := runCmdStreaming(ctx, e.FFmpegPath, args, progress); err != nil {
 		_ = os.Remove(tmpPath)
-		return res, err
+		return err
 	}
 
-	// Replace output atomically-ish: rename over existing if possible.
-	// On Windows you’d need extra handling; on Linux rename works well.
 	if err := os.Rename(tmpPath, outPath); err != nil {
 		_ = os.Remove(tmpPath)
-		return res, err
+		return err
 	}
-
-	return res, nil
+	return nil
 }
 
-func runCmdStreaming(ctx context.Context, bin string, args []string, progress func(ProgressLine)) (*RunResult, error) {
+// runCmdStreaming executes a command, streaming stderr lines to the progress
+// callback. Stdout is drained and discarded. Nothing is buffered in RAM.
+func runCmdStreaming(ctx context.Context, bin string, args []string, progress func(ProgressLine)) error {
 	cmd := exec.CommandContext(ctx, bin, args...)
 	configureCmd(cmd, bin, args)
 
-	var stdoutBuf, stderrBuf bytes.Buffer
 	stdoutPipe, err := cmd.StdoutPipe()
 	if err != nil {
-		return nil, err
+		return err
 	}
 	stderrPipe, err := cmd.StderrPipe()
 	if err != nil {
-		return nil, err
+		return err
 	}
 
 	if err := cmd.Start(); err != nil {
-		return nil, err
+		return err
 	}
 
-	// Stream stderr lines to progress callback (ffmpeg writes progress to stderr).
-	// Also capture stdout/stderr fully for logging.
 	done := make(chan struct{}, 2)
 
 	go func() {
 		defer func() { done <- struct{}{} }()
-		tee := io.TeeReader(stdoutPipe, &stdoutBuf)
-		_, _ = io.Copy(io.Discard, tee)
+		_, _ = io.Copy(io.Discard, stdoutPipe)
 	}()
 
 	go func() {
 		defer func() { done <- struct{}{} }()
-		tee := io.TeeReader(stderrPipe, &stderrBuf)
-		sc := bufio.NewScanner(tee)
-		// Allow longer lines (ffmpeg can be chatty)
+		sc := bufio.NewScanner(stderrPipe)
 		buf := make([]byte, 0, 64*1024)
 		sc.Buffer(buf, 2*1024*1024)
 		for sc.Scan() {
-			line := sc.Text()
 			if progress != nil {
-				progress(ProgressLine{Raw: line})
+				progress(ProgressLine{Raw: sc.Text()})
 			}
 		}
 	}()
@@ -200,25 +180,14 @@ func runCmdStreaming(ctx context.Context, bin string, args []string, progress fu
 	<-done
 	<-done
 
-	waitErr := cmd.Wait()
-
-	res := &RunResult{
-		Args:   append([]string{bin}, args...),
-		Stdout: stdoutBuf.String(),
-		Stderr: stderrBuf.String(),
+	if err := cmd.Wait(); err != nil {
+		return fmt.Errorf("ffmpeg failed: %w", err)
 	}
-
-	if waitErr != nil {
-		res.ExitError = waitErr
-		return res, fmt.Errorf("ffmpeg failed: %w", waitErr)
-	}
-
-	return res, nil
+	return nil
 }
 
 // ---- ffprobe helpers ----
 
-// VideoCodec returns the codec_name for the first video stream (e.g. "h264", "hevc", "av1").
 func (e *Encoder) VideoCodec(ctx context.Context, inPath string) (string, error) {
 	out, err := e.ffprobe(ctx,
 		"-v", "error",
@@ -237,7 +206,6 @@ func (e *Encoder) VideoCodec(ctx context.Context, inPath string) (string, error)
 	return s, nil
 }
 
-// DurationSeconds returns the container duration if available.
 func (e *Encoder) DurationSeconds(ctx context.Context, inPath string) (float64, error) {
 	out, err := e.ffprobe(ctx,
 		"-v", "error",
@@ -255,7 +223,6 @@ func (e *Encoder) DurationSeconds(ctx context.Context, inPath string) (float64, 
 	return strconv.ParseFloat(s, 64)
 }
 
-// VideoBitrate returns the bit_rate of the first video stream in bits/s.
 func (e *Encoder) VideoBitrate(ctx context.Context, inPath string) (int64, error) {
 	out, err := e.ffprobe(ctx,
 		"-v", "error",
@@ -274,7 +241,6 @@ func (e *Encoder) VideoBitrate(ctx context.Context, inPath string) (int64, error
 	return strconv.ParseInt(s, 10, 64)
 }
 
-// Comment returns the container-level "comment" metadata tag, if any.
 func (e *Encoder) Comment(ctx context.Context, inPath string) (string, error) {
 	out, err := e.ffprobe(ctx,
 		"-v", "error",
@@ -292,12 +258,10 @@ func (e *Encoder) Comment(ctx context.Context, inPath string) (string, error) {
 
 type hwProfile struct {
 	Name      string
-	InitArgs  []string // before -i (e.g. -vaapi_device)
-	VideoArgs []string // encoder + quality args
+	InitArgs  []string
+	VideoArgs []string
 }
 
-// CQ/QP 18 is near-visually-lossless, appropriate since this is an
-// intermediate that will later be re-encoded to AV1.
 var hevcHWProfiles = []hwProfile{
 	{Name: "hevc_nvenc", VideoArgs: []string{"-c:v", "hevc_nvenc", "-preset", "p4", "-cq", "18", "-b:v", "0"}},
 	{Name: "hevc_qsv", VideoArgs: []string{"-c:v", "hevc_qsv", "-global_quality", "18"}},
@@ -309,19 +273,15 @@ var hevcHWProfiles = []hwProfile{
 
 var av1HWNames = []string{"av1_nvenc", "av1_vaapi", "av1_qsv", "av1_amf"}
 
-// HWCaps describes what hardware encoding the system supports.
 type HWCaps struct {
-	HEVCProfile *hwProfile // nil if no usable HEVC hw encoder
+	HEVCProfile *hwProfile
 	HasAV1HW    bool
 }
 
-// UseHEVCFirst returns true when the system should encode to HEVC first
-// (HEVC hw available, AV1 hw not), letting the scanner come back for AV1 later.
 func (h HWCaps) UseHEVCFirst() bool {
 	return h.HEVCProfile != nil && !h.HasAV1HW
 }
 
-// DetectHW probes ffmpeg for hardware encoder support.
 func (e *Encoder) DetectHW(ctx context.Context) HWCaps {
 	cmd := exec.CommandContext(ctx, e.FFmpegPath, "-hide_banner", "-encoders")
 	out, err := cmd.Output()
@@ -346,8 +306,6 @@ func (e *Encoder) DetectHW(ctx context.Context) HWCaps {
 	return caps
 }
 
-// EncodeToHEVCHW does a fast hardware HEVC encode. The output replaces the
-// original, and the scanner will later pick it up for AV1 conversion.
 func (e *Encoder) EncodeToHEVCHW(ctx context.Context, inPath, outPath string, prof hwProfile, comment string, dropSubs bool, progress func(ProgressLine)) error {
 	if err := os.MkdirAll(filepath.Dir(outPath), 0o755); err != nil {
 		return err
@@ -358,7 +316,7 @@ func (e *Encoder) EncodeToHEVCHW(ctx context.Context, inPath, outPath string, pr
 	_ = os.Remove(tmpPath)
 
 	args := append([]string{}, prof.InitArgs...)
-	args = append(args, "-hide_banner", "-y", "-i", inPath, "-map", "0")
+	args = append(args, "-nostdin", "-hide_banner", "-y", "-i", inPath, "-map", "0")
 	args = append(args, prof.VideoArgs...)
 	args = append(args, "-c:a", "copy")
 	if dropSubs {
@@ -374,8 +332,7 @@ func (e *Encoder) EncodeToHEVCHW(ctx context.Context, inPath, outPath string, pr
 	}
 	args = append(args, tmpPath)
 
-	_, err := runCmdStreaming(ctx, e.FFmpegPath, args, progress)
-	if err != nil {
+	if err := runCmdStreaming(ctx, e.FFmpegPath, args, progress); err != nil {
 		_ = os.Remove(tmpPath)
 		return err
 	}
@@ -398,6 +355,13 @@ func containerMuxer(container string) string {
 }
 
 func (e *Encoder) ffprobe(ctx context.Context, args ...string) (string, error) {
+	if e.ProbeExec != nil {
+		out, stderr, err := e.ProbeExec(ctx, e.FFprobePath, args...)
+		if err != nil {
+			return "", fmt.Errorf("ffprobe error: %w: %s", err, string(stderr))
+		}
+		return string(out), nil
+	}
 	cmd := exec.CommandContext(ctx, e.FFprobePath, args...)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr

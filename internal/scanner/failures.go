@@ -6,20 +6,20 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+
+	"github.com/snadrus/flicksqueeze/internal/vfs"
 )
 
 const failuresFile = ".flicksqueeze.failures"
 
-// LoadFailures reads the persistent failures list. Files in this set have
-// previously failed encoding or validation and should be skipped.
-func LoadFailures(rootPath string) map[string]bool {
+func LoadFailures(fsys vfs.FS, rootPath string) map[string]bool {
 	set := make(map[string]bool)
-	f, err := os.Open(filepath.Join(rootPath, failuresFile))
+	rc, err := fsys.Open(filepath.Join(rootPath, failuresFile))
 	if err != nil {
 		return set
 	}
-	defer f.Close()
-	sc := bufio.NewScanner(f)
+	defer rc.Close()
+	sc := bufio.NewScanner(rc)
 	for sc.Scan() {
 		line := strings.TrimSpace(sc.Text())
 		if line != "" {
@@ -31,15 +31,13 @@ func LoadFailures(rootPath string) map[string]bool {
 
 var failMu sync.Mutex
 
-// MarkFailed appends a path to the persistent failures list. Safe for
-// concurrent use (scanner and converter run in separate goroutines).
-func MarkFailed(rootPath, path string) {
+func MarkFailed(fsys vfs.FS, rootPath, path string) {
 	failMu.Lock()
 	defer failMu.Unlock()
-	f, err := os.OpenFile(filepath.Join(rootPath, failuresFile), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	f, err := fsys.OpenFile(filepath.Join(rootPath, failuresFile), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
 	if err != nil {
 		return
 	}
 	defer f.Close()
-	f.WriteString(path + "\n")
+	f.Write([]byte(path + "\n"))
 }

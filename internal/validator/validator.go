@@ -4,20 +4,16 @@ import (
 	"context"
 	"fmt"
 	"math"
-	"os"
 
 	"github.com/snadrus/flicksqueeze/internal/ffmpeglib"
 	"github.com/snadrus/flicksqueeze/internal/paths"
+	"github.com/snadrus/flicksqueeze/internal/vfs"
 )
 
-const maxDurationDrift = 5.0 // seconds
+const maxDurationDrift = 5.0
 
-// Validate checks that an encoded output file is acceptable relative to its source.
-//   - Output must be smaller than the original.
-//   - Output must be at least MinSize (guards against corrupt/truncated files).
-//   - Durations must match within maxDurationDrift seconds.
-func Validate(ctx context.Context, enc *ffmpeglib.Encoder, inputPath, outputPath string, inputSize int64) error {
-	outInfo, err := os.Stat(outputPath)
+func Validate(ctx context.Context, fsys vfs.FS, enc *ffmpeglib.Encoder, inputPath, outputPath string, inputSize int64) error {
+	outInfo, err := fsys.Stat(outputPath)
 	if err != nil {
 		return fmt.Errorf("cannot stat output: %w", err)
 	}

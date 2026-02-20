@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"io/fs"
 	"log"
-	"os"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -13,12 +12,12 @@ import (
 
 	"github.com/snadrus/flicksqueeze/internal/ffmpeglib"
 	"github.com/snadrus/flicksqueeze/internal/paths"
+	"github.com/snadrus/flicksqueeze/internal/vfs"
 )
 
 const (
-	MaxCandidates = 10
-	flushEvery    = 1000 // flush the worst candidate after this many videos evaluated
-	staleAge      = 3 * 24 * time.Hour
+	flushEvery = 1000
+	staleAge   = 3 * 24 * time.Hour
 )
 
 var movieExtensions = map[string]bool{
@@ -28,6 +27,7 @@ var movieExtensions = map[string]bool{
 }
 
 // Directories that likely belong to other software and should not be touched.
+// AI MUST ASK BEFORE changing this.
 var skipDirs = map[string]bool{
 	".cache": true, ".config": true, ".local": true, ".steam": true,
 	"steam": true, "Steam": true, "SteamLibrary": true,
@@ -71,30 +71,24 @@ func codecWasteMultiplier(codec string) float64 {
 	return 2.0
 }
 
-// Scan walks rootPath in its own goroutine, streaming up to MaxCandidates
-// candidates on out. The old index is read one entry at a time alongside the
-// walk (never fully loaded into memory) and a new index is written as we go.
-// After every flushEvery conversion candidates it sends the worst one found
-// so far, so encoding can begin during the scan.
-// The channel is closed when the scan is complete.
-func Scan(ctx context.Context, enc *ffmpeglib.Encoder, rootPath string, out chan<- Candidate) {
+// Scan walks rootPath, streaming up to MaxCandidates candidates on out.
+func Scan(ctx context.Context, fsys vfs.FS, enc *ffmpeglib.Encoder, rootPath string, out chan<- Candidate) {
 	defer close(out)
 
 	cutoff := time.Now().Add(-staleAge)
-	failures := LoadFailures(rootPath)
+	failures := LoadFailures(fsys, rootPath)
 
-	tmpPath, newPath := prepareIndex(rootPath)
-	reader := openReader(tmpPath)
+	tmpPath, newPath := prepareIndex(fsys, rootPath)
+	reader := openReader(fsys, tmpPath)
 	defer reader.close()
 
-	writer, err := openWriter(newPath)
+	writer, err := openWriter(fsys, newPath)
 	if err != nil {
 		log.Printf("scan: cannot create index %s: %v", newPath, err)
 		return
 	}
 
 	var buf []Candidate
-	sent := 0
 	scanned := 0
 	writerOK := true
 
@@ -107,12 +101,12 @@ func Scan(ctx context.Context, enc *ffmpeglib.Encoder, rootPath string, out chan
 			WasteScore: float64(sz) * mult,
 		})
 		scanned++
-		if scanned%flushEvery == 0 && sent < MaxCandidates {
-			sent += flushBest(ctx, &buf, out, 1)
+		if scanned%flushEvery == 0 {
+			tryFlushBest(ctx, &buf, out)
 		}
 	}
 
-	_ = filepath.WalkDir(rootPath, func(path string, d fs.DirEntry, err error) error {
+	_ = fsys.Walk(rootPath, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return nil
 		}
@@ -136,7 +130,7 @@ func Scan(ctx context.Context, enc *ffmpeglib.Encoder, rootPath string, out chan
 		if failures[path] {
 			return nil
 		}
-		if isLocked(path) {
+		if isLocked(fsys, path) {
 			return nil
 		}
 
@@ -154,7 +148,7 @@ func Scan(ctx context.Context, enc *ffmpeglib.Encoder, rootPath string, out chan
 			if sz < paths.MinSize || mod.After(cutoff) || cachedCodec == "X" || cachedCodec == "av1" || cachedCodec == "flicksqueeze" {
 				return nil
 			}
-			if paths.OutputExists(path) {
+			if outputExists(fsys, path) {
 				return nil
 			}
 			enqueue(path, cachedCodec, sz)
@@ -176,32 +170,27 @@ func Scan(ctx context.Context, enc *ffmpeglib.Encoder, rootPath string, out chan
 		if codec == "av1" {
 			comment, _ := enc.Comment(ctx, path)
 			if comment == paths.MetaComment {
-				// Final AV1 output by flicksqueeze — permanently skip.
 				codec = "flicksqueeze"
 			}
-			// AV1 files with HEVCMetaComment or no tag stay as "av1" —
-			// already optimal, nothing to re-encode.
 			writer.write(path, codec, mod, sz)
 			return nil
 		}
 		writer.write(path, codec, mod, sz)
-		if paths.OutputExists(path) {
+		if outputExists(fsys, path) {
 			return nil
 		}
 		enqueue(path, codec, sz)
 		return nil
 	})
 
-	if remaining := MaxCandidates - sent; remaining > 0 {
-		flushBest(ctx, &buf, out, remaining)
-	}
+	flushAll(ctx, &buf, out)
 
 	if err := writer.close(); err != nil {
 		log.Printf("scan: index write error: %v", err)
 		writerOK = false
 	}
 	if writerOK && ctx.Err() == nil {
-		finishIndex(tmpPath, writer.n)
+		finishIndex(fsys, tmpPath, writer.n)
 	} else if ctx.Err() != nil {
 		log.Println("scan interrupted, keeping previous index")
 	}
@@ -209,34 +198,52 @@ func Scan(ctx context.Context, enc *ffmpeglib.Encoder, rootPath string, out chan
 	log.Printf("scan complete: %d conversion candidates evaluated", scanned)
 }
 
-// flushBest sorts buf descending by waste, sends up to n from the top, and
-// removes them from buf. Returns the number actually sent.
-func flushBest(ctx context.Context, buf *[]Candidate, out chan<- Candidate, n int) int {
+// tryFlushBest does a non-blocking send of the highest-waste candidate.
+// If the consumer is busy encoding, the send is skipped and the candidate
+// stays in the buffer for the end-of-scan flush.
+func tryFlushBest(_ context.Context, buf *[]Candidate, out chan<- Candidate) {
+	if len(*buf) == 0 {
+		return
+	}
 	sort.Slice(*buf, func(i, j int) bool {
 		return (*buf)[i].WasteScore > (*buf)[j].WasteScore
 	})
-	sent := 0
-	for sent < n && len(*buf) > 0 {
+	select {
+	case out <- (*buf)[0]:
+		*buf = (*buf)[1:]
+	default:
+	}
+}
+
+// flushAll sends every remaining candidate in waste-score order, blocking
+// until the consumer is ready for each one.
+func flushAll(ctx context.Context, buf *[]Candidate, out chan<- Candidate) {
+	sort.Slice(*buf, func(i, j int) bool {
+		return (*buf)[i].WasteScore > (*buf)[j].WasteScore
+	})
+	for len(*buf) > 0 {
 		select {
 		case out <- (*buf)[0]:
 			*buf = (*buf)[1:]
-			sent++
 		case <-ctx.Done():
-			return sent
+			return
 		}
 	}
-	return sent
 }
 
 const lockFreshness = 10 * time.Minute
 
-// isLocked returns true if another instance holds a fresh lock on this file.
-func isLocked(path string) bool {
-	info, err := os.Stat(path + paths.LockSuffix)
+func isLocked(fsys vfs.FS, path string) bool {
+	info, err := fsys.Stat(path + paths.LockSuffix)
 	if err != nil {
 		return false
 	}
 	return time.Since(info.ModTime()) < lockFreshness
+}
+
+func outputExists(fsys vfs.FS, path string) bool {
+	_, err := fsys.Stat(paths.OutputPath(path))
+	return err == nil
 }
 
 // HumanSize returns a human-readable byte size.
