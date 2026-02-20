@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"syscall"
@@ -43,7 +44,9 @@ func main() {
 		return
 	}
 
-	rawPath := args[0]
+	rawPath := strings.TrimSpace(args[0])
+	rawPath = strings.Trim(rawPath, `"'`)
+	rawPath = filepath.Clean(rawPath)
 	fmt.Fprintf(os.Stderr, "flicksqueeze %s\n", version)
 
 	if strings.HasPrefix(rawPath, "ssh://") {
@@ -61,6 +64,10 @@ func main() {
 		}
 		cfg.FS = vfs.Local{}
 		cfg.RootPath = rawPath
+	}
+
+	if err := ensureFFmpegInPath(); err != nil {
+		log.Fatal(err)
 	}
 
 	sigs := []os.Signal{os.Interrupt}
@@ -113,6 +120,35 @@ func printHelp() {
 	checkBin("ffmpeg")
 	checkBin("ffprobe")
 	fmt.Println()
+}
+
+// ensureFFmpegInPath checks that ffmpeg and ffprobe are on PATH. On Windows, if missing, runs winget to install.
+func ensureFFmpegInPath() error {
+	_, errFFmpeg := exec.LookPath("ffmpeg")
+	_, errProbe := exec.LookPath("ffprobe")
+	if errFFmpeg == nil && errProbe == nil {
+		return nil
+	}
+	if runtime.GOOS != "windows" {
+		if errFFmpeg != nil {
+			return fmt.Errorf("ffmpeg not found on PATH: %w", errFFmpeg)
+		}
+		return fmt.Errorf("ffprobe not found on PATH: %w", errProbe)
+	}
+	// Windows: install via winget
+	log.Println("ffmpeg/ffprobe not on PATH; installing via winget (Gyan.FFmpeg)...")
+	cmd := exec.Command("winget", "install", "Gyan.FFmpeg", "--accept-package-agreements", "--accept-source-agreements")
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("winget install Gyan.FFmpeg failed: %w (install manually: winget install Gyan.FFmpeg)", err)
+	}
+	// PATH is updated for new processes only; current process still won't see ffmpeg
+	_, errFFmpeg = exec.LookPath("ffmpeg")
+	if errFFmpeg == nil {
+		return nil
+	}
+	return fmt.Errorf("ffmpeg was installed; please run flicksqueeze again in a new terminal so PATH is updated")
 }
 
 func checkBin(name string) {
