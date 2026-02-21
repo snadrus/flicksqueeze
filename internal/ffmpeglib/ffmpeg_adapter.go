@@ -177,12 +177,15 @@ func runCmdStreaming(ctx context.Context, bin string, args []string, progress fu
 		}
 	}()
 
-	<-done
-	<-done
-
+	// Wait for process exit first so we never block on pipe reads after the process is gone.
+	// Waiting on <-done before Wait() can hang if the child exits with error and pipes don't close promptly.
 	if err := cmd.Wait(); err != nil {
+		<-done
+		<-done
 		return fmt.Errorf("ffmpeg failed: %w", err)
 	}
+	<-done
+	<-done
 	return nil
 }
 
