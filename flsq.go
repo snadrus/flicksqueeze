@@ -122,33 +122,100 @@ func printHelp() {
 	fmt.Println()
 }
 
-// ensureFFmpegInPath checks that ffmpeg and ffprobe are on PATH. On Windows, if missing, runs winget to install.
+// winget exit codes that mean "already installed" or "no update" (not a real failure)
+const (
+	wingetUpdateNotApplicable   = -1978335189 // 0x8A15002B: No applicable update found
+	wingetPackageAlreadyInstalled = -1978335135 // 0x8A150061: Package already installed
+	wingetInstallAlreadyInstalled = -1978334963 // 0x8A15010D: Another version already installed
+)
+
+// ensureFFmpegInPath checks that ffmpeg and ffprobe are available. On Windows, looks for the binary (PATH, then WinGet packages) and only runs winget if not found.
 func ensureFFmpegInPath() error {
-	_, errFFmpeg := exec.LookPath("ffmpeg")
-	_, errProbe := exec.LookPath("ffprobe")
-	if errFFmpeg == nil && errProbe == nil {
-		return nil
+	if _, err := exec.LookPath("ffmpeg"); err == nil {
+		if _, err := exec.LookPath("ffprobe"); err == nil {
+			return nil
+		}
 	}
 	if runtime.GOOS != "windows" {
-		if errFFmpeg != nil {
-			return fmt.Errorf("ffmpeg not found on PATH: %w", errFFmpeg)
+		if _, err := exec.LookPath("ffmpeg"); err != nil {
+			return fmt.Errorf("ffmpeg not found on PATH: %w", err)
 		}
-		return fmt.Errorf("ffprobe not found on PATH: %w", errProbe)
+		return fmt.Errorf("ffprobe not found on PATH")
 	}
-	// Windows: install via winget
-	log.Println("ffmpeg/ffprobe not on PATH; installing via winget (Gyan.FFmpeg)...")
+	// Windows: look for binary in WinGet packages first (no winget call)
+	if binDir := findFFmpegInWinGetPackages(); binDir != "" {
+		pathEnv := os.Getenv("PATH")
+		os.Setenv("PATH", binDir+string(filepath.ListSeparator)+pathEnv)
+		if _, err := exec.LookPath("ffmpeg"); err == nil {
+			if _, err := exec.LookPath("ffprobe"); err == nil {
+				return nil
+			}
+		}
+	}
+	// Binary not found anywhere; install via winget
+	log.Println("ffmpeg/ffprobe not found; installing via winget (Gyan.FFmpeg)...")
 	cmd := exec.Command("winget", "install", "Gyan.FFmpeg", "--accept-package-agreements", "--accept-source-agreements")
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("winget install Gyan.FFmpeg failed: %w (install manually: winget install Gyan.FFmpeg)", err)
+	err := cmd.Run()
+	if err != nil {
+		// Treat "already installed" / "no update" as success (Windows may report as signed or unsigned)
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			code := exitErr.ExitCode()
+			codeU := uint32(code)
+			if code == wingetUpdateNotApplicable || code == wingetPackageAlreadyInstalled || code == wingetInstallAlreadyInstalled ||
+				codeU == 0x8A15002B || codeU == 0x8A150061 || codeU == 0x8A15010D {
+				err = nil
+			}
+		}
+		if err != nil {
+			return fmt.Errorf("winget install Gyan.FFmpeg failed: %w (install manually: winget install Gyan.FFmpeg)", err)
+		}
 	}
-	// PATH is updated for new processes only; current process still won't see ffmpeg
-	_, errFFmpeg = exec.LookPath("ffmpeg")
-	if errFFmpeg == nil {
+	// After install, PATH may only apply to new processes; try WinGet location again
+	if _, err := exec.LookPath("ffmpeg"); err == nil {
 		return nil
 	}
+	if binDir := findFFmpegInWinGetPackages(); binDir != "" {
+		pathEnv := os.Getenv("PATH")
+		os.Setenv("PATH", binDir+string(filepath.ListSeparator)+pathEnv)
+		if _, err := exec.LookPath("ffmpeg"); err == nil {
+			return nil
+		}
+	}
 	return fmt.Errorf("ffmpeg was installed; please run flicksqueeze again in a new terminal so PATH is updated")
+}
+
+// findFFmpegInWinGetPackages returns the bin directory containing ffmpeg.exe under %LOCALAPPDATA%\Microsoft\WinGet\Packages, or "".
+func findFFmpegInWinGetPackages() string {
+	localAppData := os.Getenv("LOCALAPPDATA")
+	if localAppData == "" {
+		return ""
+	}
+	packagesDir := filepath.Join(localAppData, "Microsoft", "WinGet", "Packages")
+	entries, err := os.ReadDir(packagesDir)
+	if err != nil {
+		return ""
+	}
+	for _, e := range entries {
+		if !e.IsDir() || !strings.HasPrefix(e.Name(), "Gyan.FFmpeg") {
+			continue
+		}
+		pkgDir := filepath.Join(packagesDir, e.Name())
+		// Gyan.FFmpeg installs as .../ffmpeg-<version>-full_build/bin
+		subs, _ := os.ReadDir(pkgDir)
+		for _, s := range subs {
+			if !s.IsDir() || !strings.HasPrefix(s.Name(), "ffmpeg-") {
+				continue
+			}
+			binDir := filepath.Join(pkgDir, s.Name(), "bin")
+			ffmpegExe := filepath.Join(binDir, "ffmpeg.exe")
+			if _, err := os.Stat(ffmpegExe); err == nil {
+				return binDir
+			}
+		}
+	}
+	return ""
 }
 
 func checkBin(name string) {

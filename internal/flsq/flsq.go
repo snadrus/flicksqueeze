@@ -364,6 +364,9 @@ func encodeHEVC(ctx context.Context, enc *ffmpeglib.Encoder, inPath, outPath str
 		hwCtx2, hwCancel2 := context.WithTimeout(ctx, timeout)
 		err = enc.EncodeToHEVCHW(hwCtx2, inPath, outPath, *hw.HEVCProfile, paths.HEVCMetaComment, true, progress)
 		hwCancel2()
+		if err != nil {
+			log.Printf("HEVC retry without subtitles failed: %v", err)
+		}
 	}
 	return err
 }
@@ -392,6 +395,9 @@ func encodeAV1(ctx context.Context, enc *ffmpeglib.Encoder, inPath, outPath stri
 		encCtx2, encCancel2 := context.WithTimeout(ctx, timeout)
 		err = enc.EncodeToAV1SVT(encCtx2, inPath, outPath, opts, progress)
 		encCancel2()
+		if err != nil {
+			log.Printf("AV1 retry without subtitles failed: %v", err)
+		}
 	}
 	return err
 }
