@@ -159,13 +159,16 @@ func Run(ctx context.Context, cfg Config) error {
 	st := status{sessionStart: time.Now()}
 	quitCh := startConsole(&st)
 
-	ctx, cancelAll := context.WithCancel(ctx)
-	defer cancelAll()
+	// scanCtx is cancelled when the user asks to quit, stopping the scanner
+	// and the candidate loop. The parent ctx stays live so the in-flight
+	// ffmpeg encode finishes gracefully before the process exits.
+	scanCtx, cancelScan := context.WithCancel(ctx)
+	defer cancelScan()
 	go func() {
 		select {
 		case <-quitCh:
 			log.Println(">>> graceful stop requested — will finish current encode then exit")
-			cancelAll()
+			cancelScan()
 		case <-ctx.Done():
 		}
 	}()
@@ -187,11 +190,11 @@ func Run(ctx context.Context, cfg Config) error {
 
 	for {
 		ch := make(chan scanner.Candidate)
-		go scanner.Scan(ctx, cfg.FS, enc, cfg.RootPath, ch)
+		go scanner.Scan(scanCtx, cfg.FS, enc, cfg.RootPath, ch)
 
 		processed := 0
 		for c := range ch {
-			if ctx.Err() != nil {
+			if scanCtx.Err() != nil {
 				for range ch {
 				}
 				return nil
@@ -200,15 +203,20 @@ func Run(ctx context.Context, cfg Config) error {
 			log.Printf("candidate %d: [%s] %s (%s, codec=%s)",
 				processed, scanner.HumanSize(c.Size), c.Path, fmtWaste(c.WasteScore), c.Codec)
 			processCandidate(ctx, cfg, enc, c, hw, &st)
+			if scanCtx.Err() != nil {
+				for range ch {
+				}
+				return nil
+			}
 		}
 
-		if ctx.Err() != nil {
+		if scanCtx.Err() != nil {
 			return nil
 		}
 
 		if processed == 0 {
 			log.Println("no conversion candidates found, sleeping 24 hours")
-			if !sleepCtx(ctx, idleSleep) {
+			if !sleepCtx(scanCtx, idleSleep) {
 				return nil
 			}
 		}
