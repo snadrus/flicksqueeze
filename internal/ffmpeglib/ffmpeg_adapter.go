@@ -99,7 +99,7 @@ func (e *Encoder) EncodeToAV1SVT(ctx context.Context, inPath, outPath string, op
 		"-hide_banner",
 		"-y",
 		"-i", inPath,
-		"-map", "0",
+		"-map", "0:v", "-map", "0:a?",
 		"-c:v", "libsvtav1",
 		"-crf", strconv.Itoa(opt.CRF),
 		"-preset", strconv.Itoa(opt.Preset),
@@ -111,7 +111,7 @@ func (e *Encoder) EncodeToAV1SVT(ctx context.Context, inPath, outPath string, op
 	if opt.DropSubtitles {
 		args = append(args, "-sn")
 	} else {
-		args = append(args, "-c:s", "copy")
+		args = append(args, "-map", "0:s?", "-c:s", "copy")
 	}
 
 	args = append(args, "-metadata", "comment="+opt.MetaComment)
@@ -319,13 +319,13 @@ func (e *Encoder) EncodeToHEVCHW(ctx context.Context, inPath, outPath string, pr
 	_ = os.Remove(tmpPath)
 
 	args := append([]string{}, prof.InitArgs...)
-	args = append(args, "-nostdin", "-hide_banner", "-y", "-i", inPath, "-map", "0")
+	args = append(args, "-nostdin", "-hide_banner", "-y", "-i", inPath, "-map", "0:v", "-map", "0:a?")
 	args = append(args, prof.VideoArgs...)
 	args = append(args, "-c:a", "copy")
 	if dropSubs {
 		args = append(args, "-sn")
 	} else {
-		args = append(args, "-c:s", "copy")
+		args = append(args, "-map", "0:s?", "-c:s", "copy")
 	}
 	if comment != "" {
 		args = append(args, "-metadata", "comment="+comment)
