@@ -140,7 +140,7 @@ func (e *Encoder) EncodeToAV1SVT(ctx context.Context, inPath, outPath string, op
 }
 
 // runCmdStreaming executes a command, streaming stderr lines to the progress
-// callback. Stdout is drained and discarded. Nothing is buffered in RAM.
+// callback. Stdout is drained and discarded.
 func runCmdStreaming(ctx context.Context, bin string, args []string, progress func(ProgressLine)) error {
 	cmd := exec.CommandContext(ctx, bin, args...)
 	configureCmd(cmd, bin, args)
@@ -168,6 +168,7 @@ func runCmdStreaming(ctx context.Context, bin string, args []string, progress fu
 	go func() {
 		defer func() { done <- struct{}{} }()
 		sc := bufio.NewScanner(stderrPipe)
+		sc.Split(scanCRLF)
 		buf := make([]byte, 0, 64*1024)
 		sc.Buffer(buf, 2*1024*1024)
 		for sc.Scan() {
@@ -177,16 +178,34 @@ func runCmdStreaming(ctx context.Context, bin string, args []string, progress fu
 		}
 	}()
 
-	// Wait for process exit first so we never block on pipe reads after the process is gone.
-	// Waiting on <-done before Wait() can hang if the child exits with error and pipes don't close promptly.
+	// Drain pipes fully before calling Wait. StdoutPipe/StderrPipe docs:
+	// "it is incorrect to call Wait before all reads from the pipe have
+	// completed." The goroutines see EOF once the child exits and the
+	// kernel closes the write end of each pipe.
+	<-done
+	<-done
+
 	if err := cmd.Wait(); err != nil {
-		<-done
-		<-done
 		return fmt.Errorf("ffmpeg failed: %w", err)
 	}
-	<-done
-	<-done
 	return nil
+}
+
+// scanCRLF splits on \n or \r so ffmpeg's carriage-return progress output
+// is delivered line-by-line instead of accumulating in the buffer.
+func scanCRLF(data []byte, atEOF bool) (advance int, token []byte, err error) {
+	if atEOF && len(data) == 0 {
+		return 0, nil, nil
+	}
+	for i, b := range data {
+		if b == '\n' || b == '\r' {
+			return i + 1, data[:i], nil
+		}
+	}
+	if atEOF {
+		return len(data), data, nil
+	}
+	return 0, nil, nil
 }
 
 // ---- ffprobe helpers ----
