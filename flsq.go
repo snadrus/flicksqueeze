@@ -46,7 +46,10 @@ func main() {
 
 	rawPath := strings.TrimSpace(args[0])
 	rawPath = strings.Trim(rawPath, `"'`)
-	rawPath = filepath.Clean(rawPath)
+	// Don't run filepath.Clean on ssh:// URLs: on Windows it turns / into \, breaking the URL.
+	if !strings.HasPrefix(rawPath, "ssh://") {
+		rawPath = filepath.Clean(rawPath)
+	}
 	fmt.Fprintf(os.Stderr, "flicksqueeze %s\n", version)
 
 	if strings.HasPrefix(rawPath, "ssh://") {
