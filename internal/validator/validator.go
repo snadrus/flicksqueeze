@@ -12,6 +12,15 @@ import (
 
 const maxDurationDrift = 5.0
 
+func formatSizeBytes(n int64) string {
+	const gb = 1024 * 1024 * 1024
+	const mb = 1024 * 1024
+	if n >= gb {
+		return fmt.Sprintf("%.1f GiB (%d bytes)", float64(n)/gb, n)
+	}
+	return fmt.Sprintf("%.0f MiB (%d bytes)", float64(n)/mb, n)
+}
+
 func Validate(ctx context.Context, fsys vfs.FS, enc *ffmpeglib.Encoder, inputPath, outputPath string, inputSize int64) error {
 	outInfo, err := fsys.Stat(outputPath)
 	if err != nil {
@@ -20,10 +29,12 @@ func Validate(ctx context.Context, fsys vfs.FS, enc *ffmpeglib.Encoder, inputPat
 	outSize := outInfo.Size()
 
 	if outSize >= inputSize {
-		return fmt.Errorf("output (%d bytes) is not smaller than input (%d bytes)", outSize, inputSize)
+		return fmt.Errorf("output %s (%s) is not smaller than input %s (%s)",
+			outputPath, formatSizeBytes(outSize),
+			inputPath, formatSizeBytes(inputSize))
 	}
 	if outSize < paths.MinSize {
-		return fmt.Errorf("output too small (%d bytes), likely corrupt", outSize)
+		return fmt.Errorf("output %s too small (%s), likely corrupt", outputPath, formatSizeBytes(outSize))
 	}
 
 	inDur, err := enc.DurationSeconds(ctx, inputPath)

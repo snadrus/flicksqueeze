@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -30,9 +31,24 @@ const (
 )
 
 type Config struct {
-	RootPath string
-	NoDelete bool
-	FS       vfs.FS
+	RootPath    string
+	NoDelete    bool
+	FS          vfs.FS
+	UploadQueue chan<- remoteUploadJob // when set, remote encodes queue uploads instead of blocking
+	UploadWg    *sync.WaitGroup       // incremented per queued upload; wait before exit
+}
+
+// remoteUploadJob is sent to the upload worker after a remote encode completes.
+type remoteUploadJob struct {
+	LocalOut      string
+	RemoteTmpPath string
+	OutPath       string
+	TmpDir        string
+	EncType       string
+	C             scanner.Candidate
+	Cfg           Config
+	Enc           *ffmpeglib.Encoder
+	St            *status
 }
 
 // status tracks what the converter is doing so the interactive console
@@ -184,7 +200,7 @@ func Run(ctx context.Context, cfg Config) error {
 		log.Printf("HEVC hw available (%s): will convert worst codecs to HEVC first, AV1 after", hw.HEVCProfile.Name)
 	}
 	if cfg.FS.IsRemote() {
-		log.Println("remote mode: files will be downloaded for local encoding")
+		log.Println("remote mode: files will be downloaded for local encoding (upload overlaps with next download)")
 	}
 	log.Println("press Enter for status, q+Enter to quit")
 
@@ -192,10 +208,23 @@ func Run(ctx context.Context, cfg Config) error {
 		ch := make(chan scanner.Candidate)
 		go scanner.Scan(scanCtx, cfg.FS, enc, cfg.RootPath, ch)
 
+		var uploadChan chan remoteUploadJob
+		var uploadWg sync.WaitGroup
+		if cfg.FS.IsRemote() {
+			uploadChan = make(chan remoteUploadJob, 4)
+			cfg.UploadQueue = uploadChan
+			cfg.UploadWg = &uploadWg
+			go runUploadWorker(uploadChan, &uploadWg)
+		}
+
 		processed := 0
 		for c := range ch {
 			if scanCtx.Err() != nil {
 				for range ch {
+				}
+				if cfg.FS.IsRemote() {
+					close(uploadChan)
+					uploadWg.Wait()
 				}
 				return nil
 			}
@@ -206,8 +235,17 @@ func Run(ctx context.Context, cfg Config) error {
 			if scanCtx.Err() != nil {
 				for range ch {
 				}
+				if cfg.FS.IsRemote() {
+					close(uploadChan)
+					uploadWg.Wait()
+				}
 				return nil
 			}
+		}
+
+		if cfg.FS.IsRemote() {
+			close(uploadChan)
+			uploadWg.Wait()
 		}
 
 		if scanCtx.Err() != nil {
@@ -284,8 +322,12 @@ func processCandidate(ctx context.Context, cfg Config, enc *ffmpeglib.Encoder, c
 		st.updateProgress(p.Raw)
 	}
 
+	var queuedJob *remoteUploadJob
+	if fsys.IsRemote() && cfg.UploadQueue != nil {
+		queuedJob = &remoteUploadJob{C: c, Cfg: cfg, Enc: enc, St: st, EncType: encType}
+	}
 	if fsys.IsRemote() {
-		err = encodeRemote(ctx, cfg, enc, c, outPath, useHEVC, hw, timeout, progress)
+		err = encodeRemote(ctx, cfg, enc, c, outPath, useHEVC, hw, timeout, progress, encType, queuedJob)
 	} else {
 		if useHEVC {
 			err = encodeHEVC(ctx, enc, c.Path, outPath, hw, timeout, progress)
@@ -303,6 +345,13 @@ func processCandidate(ctx context.Context, cfg Config, enc *ffmpeglib.Encoder, c
 		return
 	}
 
+	// --- remote async: upload runs in worker so next download can start immediately ---
+	if fsys.IsRemote() && cfg.UploadQueue != nil && queuedJob != nil {
+		cfg.UploadWg.Add(1)
+		cfg.UploadQueue <- *queuedJob
+		return
+	}
+
 	// --- validate (probes run where files live) ---
 	if err := validator.Validate(ctx, fsys, enc, c.Path, outPath, c.Size); err != nil {
 		log.Printf("validation failed for %s: %v", c.Path, err)
@@ -316,15 +365,21 @@ func processCandidate(ctx context.Context, cfg Config, enc *ffmpeglib.Encoder, c
 	finishConversion(fsys, c, outPath, cfg.RootPath, cfg.NoDelete, encType, st)
 }
 
-// encodeRemote downloads the source, encodes locally, and uploads the result.
-func encodeRemote(ctx context.Context, cfg Config, enc *ffmpeglib.Encoder, c scanner.Candidate, outPath string, useHEVC bool, hw ffmpeglib.HWCaps, timeout time.Duration, progress func(ffmpeglib.ProgressLine)) error {
+// encodeRemote downloads the source, encodes locally, and optionally uploads (sync) or fills job for async upload.
+// If job is non-nil, a unique tmpDir is used and the worker must remove it after uploading; upload is not done here.
+func encodeRemote(ctx context.Context, cfg Config, enc *ffmpeglib.Encoder, c scanner.Candidate, outPath string, useHEVC bool, hw ffmpeglib.HWCaps, timeout time.Duration, progress func(ffmpeglib.ProgressLine), encType string, job *remoteUploadJob) error {
 	tmpDir := filepath.Join(os.TempDir(), "flicksqueeze-work")
-	// Clean stale files from a previous crash, then recreate.
-	os.RemoveAll(tmpDir)
+	if job != nil {
+		tmpDir = filepath.Join(os.TempDir(), "flicksqueeze-work-"+strconv.FormatInt(time.Now().UnixNano(), 10))
+	} else {
+		os.RemoveAll(tmpDir)
+	}
 	if err := os.MkdirAll(tmpDir, 0o755); err != nil {
 		return err
 	}
-	defer os.RemoveAll(tmpDir)
+	if job == nil {
+		defer os.RemoveAll(tmpDir)
+	}
 
 	localIn := filepath.Join(tmpDir, "input"+filepath.Ext(c.Path))
 	localOut := filepath.Join(tmpDir, "output"+paths.OutputExt)
@@ -341,22 +396,67 @@ func encodeRemote(ctx context.Context, cfg Config, enc *ffmpeglib.Encoder, c sca
 		err = encodeAV1(ctx, enc, localIn, localOut, timeout, progress)
 	}
 	if err != nil {
+		if job != nil {
+			os.RemoveAll(tmpDir)
+		}
 		return err
 	}
 
 	remoteTmpPath := outPath[:len(outPath)-len(filepath.Ext(outPath))] +
 		".tmp-flsq-upload-" + paths.Hostname() + paths.OutputExt
 
+	if job != nil {
+		job.LocalOut = localOut
+		job.RemoteTmpPath = remoteTmpPath
+		job.OutPath = outPath
+		job.TmpDir = tmpDir
+		job.EncType = encType
+		return nil
+	}
+
 	log.Printf("uploading result to %s...", remoteTmpPath)
 	if err := cfg.FS.CopyFromLocal(localOut, remoteTmpPath); err != nil {
 		return fmt.Errorf("upload failed: %w", err)
 	}
-
 	if err := cfg.FS.Rename(remoteTmpPath, outPath); err != nil {
 		_ = cfg.FS.Remove(remoteTmpPath)
 		return fmt.Errorf("remote rename failed: %w", err)
 	}
 	return nil
+}
+
+// runUploadWorker consumes upload jobs and runs upload, validate, and finishConversion.
+// Allows the next candidate to start downloading/encoding while the previous upload runs.
+func runUploadWorker(ch <-chan remoteUploadJob, wg *sync.WaitGroup) {
+	for job := range ch {
+		func() {
+			defer wg.Done()
+			ctx := context.Background()
+			log.Printf("uploading result to %s...", job.RemoteTmpPath)
+			if err := job.Cfg.FS.CopyFromLocal(job.LocalOut, job.RemoteTmpPath); err != nil {
+				log.Printf("upload failed for %s: %v", job.C.Path, err)
+				_ = job.Cfg.FS.Remove(job.OutPath)
+				scanner.MarkFailed(job.Cfg.FS, job.Cfg.RootPath, job.C.Path)
+				os.RemoveAll(job.TmpDir)
+				return
+			}
+			if err := job.Cfg.FS.Rename(job.RemoteTmpPath, job.OutPath); err != nil {
+				_ = job.Cfg.FS.Remove(job.RemoteTmpPath)
+				log.Printf("remote rename failed for %s: %v", job.C.Path, err)
+				scanner.MarkFailed(job.Cfg.FS, job.Cfg.RootPath, job.C.Path)
+				os.RemoveAll(job.TmpDir)
+				return
+			}
+			os.RemoveAll(job.TmpDir)
+			if err := validator.Validate(ctx, job.Cfg.FS, job.Enc, job.C.Path, job.OutPath, job.C.Size); err != nil {
+				log.Printf("validation failed for %s: %v", job.C.Path, err)
+				_ = job.Cfg.FS.Remove(job.OutPath)
+				scanner.MarkFailed(job.Cfg.FS, job.Cfg.RootPath, job.C.Path)
+				return
+			}
+			finishConversion(job.Cfg.FS, job.C, job.OutPath, job.Cfg.RootPath, job.Cfg.NoDelete, job.EncType, job.St)
+		}()
+	}
 }
 
 func encodeHEVC(ctx context.Context, enc *ffmpeglib.Encoder, inPath, outPath string, hw ffmpeglib.HWCaps, timeout time.Duration, progress func(ffmpeglib.ProgressLine)) error {
@@ -379,16 +479,26 @@ func encodeHEVC(ctx context.Context, enc *ffmpeglib.Encoder, inPath, outPath str
 	return err
 }
 
+// isHighBitDepth reports whether the ffmpeg pix_fmt is 10- or 12-bit (e.g. yuv420p10le).
+func isHighBitDepth(pixFmt string) bool {
+	return strings.Contains(pixFmt, "10") || strings.Contains(pixFmt, "12")
+}
+
 func encodeAV1(ctx context.Context, enc *ffmpeglib.Encoder, inPath, outPath string, timeout time.Duration, progress func(ffmpeglib.ProgressLine)) error {
 	log.Printf("AV1 sw encode %s -> %s", inPath, outPath)
 
+	pixFmt := "yuv420p10le"
+	if pf, err := enc.VideoPixFmt(ctx, inPath); err == nil && pf != "" && !isHighBitDepth(pf) {
+		pixFmt = "yuv420p"
+	}
+
 	opts := ffmpeglib.AV1Options{
-		CRF:              28,
+		CRF:              30,
 		Preset:           5,
 		Threads:          encodeThreads(),
 		SkipIfAlreadyAV1: true,
 		Container:        "mkv",
-		PixFmt:           "yuv420p10le",
+		PixFmt:           pixFmt,
 		MetaComment:      paths.MetaComment,
 	}
 

@@ -12,6 +12,8 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/snadrus/flicksqueeze/internal/paths"
 )
@@ -139,10 +141,21 @@ func (e *Encoder) EncodeToAV1SVT(ctx context.Context, inPath, outPath string, op
 	return nil
 }
 
+// Progress check interval and timeout: if no stderr line from ffmpeg for
+// noProgressTimeout, the encode is treated as stuck and cancelled.
+const (
+	progressCheckInterval = 1 * time.Minute
+	noProgressTimeout     = 15 * time.Minute
+)
+
 // runCmdStreaming executes a command, streaming stderr lines to the progress
-// callback. Stdout is drained and discarded.
+// callback. Stdout is drained and discarded. If no progress line is received
+// for noProgressTimeout, the command is cancelled (stuck encode).
 func runCmdStreaming(ctx context.Context, bin string, args []string, progress func(ProgressLine)) error {
-	cmd := exec.CommandContext(ctx, bin, args...)
+	progressCtx, progressCancel := context.WithCancel(ctx)
+	defer progressCancel()
+
+	cmd := exec.CommandContext(progressCtx, bin, args...)
 	configureCmd(cmd, bin, args)
 
 	stdoutPipe, err := cmd.StdoutPipe()
@@ -159,6 +172,8 @@ func runCmdStreaming(ctx context.Context, bin string, args []string, progress fu
 	}
 
 	done := make(chan struct{}, 2)
+	var lastProgressMu sync.Mutex
+	lastProgress := time.Now()
 
 	go func() {
 		defer func() { done <- struct{}{} }()
@@ -172,8 +187,35 @@ func runCmdStreaming(ctx context.Context, bin string, args []string, progress fu
 		buf := make([]byte, 0, 64*1024)
 		sc.Buffer(buf, 2*1024*1024)
 		for sc.Scan() {
+			lastProgressMu.Lock()
+			lastProgress = time.Now()
+			lastProgressMu.Unlock()
 			if progress != nil {
 				progress(ProgressLine{Raw: sc.Text()})
+			}
+		}
+	}()
+
+	noProgressCancel := make(chan struct{}, 1)
+	go func() {
+		ticker := time.NewTicker(progressCheckInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-progressCtx.Done():
+				return
+			case <-ticker.C:
+				lastProgressMu.Lock()
+				t := lastProgress
+				lastProgressMu.Unlock()
+				if time.Since(t) > noProgressTimeout {
+					select {
+					case noProgressCancel <- struct{}{}:
+					default:
+					}
+					progressCancel()
+					return
+				}
 			}
 		}
 	}()
@@ -185,7 +227,13 @@ func runCmdStreaming(ctx context.Context, bin string, args []string, progress fu
 	<-done
 	<-done
 
-	if err := cmd.Wait(); err != nil {
+	err = cmd.Wait()
+	select {
+	case <-noProgressCancel:
+		return fmt.Errorf("encode cancelled: no progress for %v", noProgressTimeout)
+	default:
+	}
+	if err != nil {
 		return fmt.Errorf("ffmpeg failed: %w", err)
 	}
 	return nil
@@ -261,6 +309,22 @@ func (e *Encoder) VideoBitrate(ctx context.Context, inPath string) (int64, error
 		return 0, errors.New("video bitrate unavailable")
 	}
 	return strconv.ParseInt(s, 10, 64)
+}
+
+// VideoPixFmt returns the video stream pixel format (e.g. yuv420p, yuv420p10le).
+// Empty string and error if unavailable.
+func (e *Encoder) VideoPixFmt(ctx context.Context, inPath string) (string, error) {
+	out, err := e.ffprobe(ctx,
+		"-v", "error",
+		"-select_streams", "v:0",
+		"-show_entries", "stream=pix_fmt",
+		"-of", "default=nokey=1:noprint_wrappers=1",
+		inPath,
+	)
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(out), nil
 }
 
 func (e *Encoder) Comment(ctx context.Context, inPath string) (string, error) {
