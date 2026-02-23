@@ -119,6 +119,15 @@ func printHelp() {
 	fmt.Println("  [Ctrl+C]      Abort immediately")
 	fmt.Println()
 
+	fmt.Println("FILES (written inside <movie-folder>)")
+	fmt.Println("  .flicksqueeze-<host>.idx       Codec cache (avoids re-probing files)")
+	fmt.Println("  .flicksqueeze.failures         Paths that failed to encode")
+	fmt.Println("  .flicksqueeze.log              Tally of completed conversions")
+	fmt.Println("  <movie>.flsq-lock              Per-file lock while encoding")
+	fmt.Println("  <movie>.mkv                    Transcoded output (or <movie>.av1tmp.mkv)")
+	fmt.Println("  <movie>_deleteMe.<ext>         Original after conversion (--no-delete)")
+	fmt.Println()
+
 	fmt.Println("DEPENDENCIES")
 	checkBin("ffmpeg")
 	checkBin("ffprobe")
