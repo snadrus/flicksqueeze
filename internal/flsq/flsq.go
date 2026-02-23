@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -25,8 +26,8 @@ const (
 	idleSleep   = 24 * time.Hour
 	baselineGHz = 2.5
 	baseRateH   = 3.0
-	safetyMult  = 3.0
-	minTimeoutH = 4.0
+	safetyMult  = 5.0
+	minTimeoutH = 8.0
 	maxTimeoutH = 96.0
 )
 
@@ -192,7 +193,7 @@ func Run(ctx context.Context, cfg Config) error {
 	hw := enc.DetectHW(ctx)
 	threads := encodeThreads()
 	ghz := cpuGHz()
-	score := float64(threads) * (ghz / baselineGHz)
+	score := math.Sqrt(float64(threads)) * (ghz / baselineGHz)
 	ratePerGB := (baseRateH / score) * safetyMult
 	log.Printf("flicksqueeze watching %s (threads=%d, cpu=%.1f GHz, ~%.1fh timeout per GB)",
 		cfg.RootPath, threads, ghz, ratePerGB)
@@ -580,7 +581,9 @@ func encodeThreads() int {
 func encodeTimeoutForSize(fileSize int64) time.Duration {
 	threads := float64(encodeThreads())
 	speedFactor := cpuGHz() / baselineGHz
-	score := threads * speedFactor
+	// sqrt(threads): SVT-AV1 has diminishing returns beyond ~6 threads
+	// due to pipeline stages, synchronization, and memory bandwidth.
+	score := math.Sqrt(threads) * speedFactor
 
 	gb := float64(fileSize) / (1024 * 1024 * 1024)
 	hours := (baseRateH / score) * safetyMult * gb
