@@ -79,6 +79,16 @@ func DialSSH(rawURL string) (*SFTP, string, error) {
 		return nil, "", fmt.Errorf("ssh dial %s: %w", addr, err)
 	}
 
+	// Expand ~ to remote user's home directory if present in path
+	if strings.Contains(remotePath, "~") {
+		home, err := remoteHomeDir(sshc)
+		if err != nil {
+			sshc.Close()
+			return nil, "", fmt.Errorf("remote home dir: %w", err)
+		}
+		remotePath = expandTilde(remotePath, home)
+	}
+
 	sc, err := sftp.NewClient(sshc)
 	if err != nil {
 		sshc.Close()
@@ -87,6 +97,45 @@ func DialSSH(rawURL string) (*SFTP, string, error) {
 
 	log.Printf("connected to %s:%s, root=%s", host, port, remotePath)
 	return &SFTP{client: sc, sshc: sshc}, remotePath, nil
+}
+
+// remoteHomeDir runs a command over SSH to get the remote user's home directory.
+func remoteHomeDir(sshc *ssh.Client) (string, error) {
+	session, err := sshc.NewSession()
+	if err != nil {
+		return "", err
+	}
+	defer session.Close()
+	var out bytes.Buffer
+	session.Stdout = &out
+	// Try printenv HOME first (POSIX); fallback to echo $HOME for minimal shells
+	if err := session.Run("printenv HOME"); err != nil {
+		out.Reset()
+		session.Stdout = &out
+		if err2 := session.Run("echo $HOME"); err2 != nil {
+			return "", fmt.Errorf("could not get remote HOME: %w", err)
+		}
+	}
+	home := strings.TrimSpace(out.String())
+	if home == "" {
+		return "", fmt.Errorf("remote HOME is empty")
+	}
+	return home, nil
+}
+
+// expandTilde replaces leading ~ or /~ in path with the remote home directory.
+func expandTilde(path, home string) string {
+	path = strings.TrimPrefix(path, "/")
+	if path == "~" || path == "" {
+		return home
+	}
+	if strings.HasPrefix(path, "~/") {
+		return home + path[1:]
+	}
+	if strings.HasPrefix(path, "~") {
+		return home + path[1:]
+	}
+	return "/" + path
 }
 
 func (s *SFTP) Close() error {
