@@ -98,7 +98,7 @@ func Scan(ctx context.Context, fsys vfs.FS, enc *ffmpeglib.Encoder, rootPath str
 			Path:       path,
 			Size:       sz,
 			Codec:      codec,
-			WasteScore: float64(sz) * mult,
+			WasteScore: float64(sz) * (1 - 1/mult),
 		})
 		scanned++
 		if scanned%flushEvery == 0 {
