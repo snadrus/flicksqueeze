@@ -23,12 +23,12 @@ import (
 )
 
 const (
-	idleSleep   = 24 * time.Hour
-	baselineGHz = 2.5
-	baseRateH   = 3.0
-	safetyMult  = 5.0
-	minTimeoutH = 8.0
-	maxTimeoutH = 96.0
+	idleRescanSleep = 15 * time.Minute // when scan finds 0 candidates, sleep then rescan (no long pause when list had work)
+	baselineGHz     = 2.5
+	baseRateH       = 3.0
+	safetyMult      = 5.0
+	minTimeoutH     = 8.0
+	maxTimeoutH     = 96.0
 )
 
 type Config struct {
@@ -208,6 +208,7 @@ func Run(ctx context.Context, cfg Config) error {
 	for {
 		ch := make(chan scanner.Candidate)
 		go scanner.Scan(scanCtx, cfg.FS, enc, cfg.RootPath, ch)
+		log.Println("scanning for conversion candidates...")
 
 		var uploadChan chan remoteUploadJob
 		var uploadWg sync.WaitGroup
@@ -254,8 +255,8 @@ func Run(ctx context.Context, cfg Config) error {
 		}
 
 		if processed == 0 {
-			log.Println("no conversion candidates found, sleeping 24 hours")
-			if !sleepCtx(scanCtx, idleSleep) {
+			log.Println("no conversion candidates found, rescanning in", idleRescanSleep)
+			if !sleepCtx(scanCtx, idleRescanSleep) {
 				return nil
 			}
 		}

@@ -213,6 +213,9 @@ func runCmdStreaming(ctx context.Context, bin string, args []string, progress fu
 					case noProgressCancel <- struct{}{}:
 					default:
 					}
+					if cmd.Process != nil {
+						_ = cmd.Process.Kill()
+					}
 					progressCancel()
 					return
 				}
