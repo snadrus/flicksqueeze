@@ -157,7 +157,7 @@ nohup flicksqueeze /movies >> /var/log/flicksqueeze.log 2>&1 &
 ```
 
 1. **Scan** — walks the folder tree, skips files < 10 MB or modified within 3 days, probes codecs via ffprobe (cached in a per-machine index)
-2. **Rank** — scores each file by `size * codec_waste_multiplier` (h264 = 2x, mpeg2 = 4x, hevc = 1.4x, ...)
+2. **Rank** — scores each file by `size * savings_ratio` (h264 ≈32%, mpeg2 ≈75%, hevc ≈35%, …; overridden by empirical tally when available)
 3. **Convert** — after 1000 files scanned, starts encoding the worst candidate; streams more candidates as scanning continues
 4. **Validate** — checks output is smaller, > 10 MB, and duration matches within 5 seconds
 5. **Replace** — retires the original, renames output to the original filename
