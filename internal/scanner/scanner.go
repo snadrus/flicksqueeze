@@ -40,20 +40,22 @@ var skipDirs = map[string]bool{
 	"Caches": true, "Library": true,
 }
 
-var codecWaste = map[string]float64{
-	"mpeg1video": 4.0,
-	"mpeg2video": 4.0,
-	"msmpeg4v1":  3.5,
-	"msmpeg4v2":  3.5,
-	"msmpeg4v3":  3.5,
-	"wmv1":       3.5,
-	"wmv2":       3.5,
-	"wmv3":       3.5,
-	"mpeg4":      3.0,
-	"vp8":        2.5,
-	"h264":       2.0,
-	"hevc":       1.4,
-	"vp9":        1.3,
+// codecSavings is the default savings ratio [0,1] when converting to AV1.
+// Overridden by empirical LoadTally when available.
+var codecSavings = map[string]float64{
+	"mpeg1video": 0.75,
+	"mpeg2video": 0.75,
+	"msmpeg4v1":  0.71,
+	"msmpeg4v2":  0.71,
+	"msmpeg4v3":  0.71,
+	"wmv1":       0.71,
+	"wmv2":       0.71,
+	"wmv3":       0.71,
+	"mpeg4":      0.56,  // tally
+	"vp8":        0.60,
+	"h264":       0.32,  // tally
+	"hevc":       0.35,  // tally
+	"vp9":        0.23,
 }
 
 type Candidate struct {
@@ -63,12 +65,18 @@ type Candidate struct {
 	WasteScore float64
 }
 
-func codecWasteMultiplier(codec string) float64 {
+// savingsRatio returns expected savings [0,1]. Tally overrides codecSavings when present.
+func savingsRatio(codec string, tally map[string]float64) float64 {
 	c := strings.ToLower(codec)
-	if m, ok := codecWaste[c]; ok {
-		return m
+	if tally != nil {
+		if r, ok := tally[c]; ok && r > 0 {
+			return r
+		}
 	}
-	return 2.0
+	if r, ok := codecSavings[c]; ok {
+		return r
+	}
+	return 0.50 // unknown codec
 }
 
 // Scan walks rootPath, streaming up to MaxCandidates candidates on out.
@@ -77,6 +85,7 @@ func Scan(ctx context.Context, fsys vfs.FS, enc *ffmpeglib.Encoder, rootPath str
 
 	cutoff := time.Now().Add(-staleAge)
 	failures := LoadFailures(fsys, rootPath)
+	tally := LoadTally(fsys, filepath.Join(rootPath, paths.TallyFile))
 
 	tmpPath, newPath := prepareIndex(fsys, rootPath)
 	reader := openReader(fsys, tmpPath)
@@ -93,12 +102,12 @@ func Scan(ctx context.Context, fsys vfs.FS, enc *ffmpeglib.Encoder, rootPath str
 	writerOK := true
 
 	enqueue := func(path, codec string, sz int64) {
-		mult := codecWasteMultiplier(codec)
+		savings := savingsRatio(codec, tally)
 		buf = append(buf, Candidate{
 			Path:       path,
 			Size:       sz,
 			Codec:      codec,
-			WasteScore: float64(sz) * (1 - 1/mult),
+			WasteScore: float64(sz) * savings,
 		})
 		scanned++
 		if scanned%flushEvery == 0 {
