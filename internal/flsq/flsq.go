@@ -36,7 +36,7 @@ type Config struct {
 	NoDelete    bool
 	FS          vfs.FS
 	UploadQueue chan<- remoteUploadJob // when set, remote encodes queue uploads instead of blocking
-	UploadWg    *sync.WaitGroup       // incremented per queued upload; wait before exit
+	UploadWg    *sync.WaitGroup        // incremented per queued upload; wait before exit
 }
 
 // remoteUploadJob is sent to the upload worker after a remote encode completes.
@@ -359,7 +359,7 @@ func processCandidate(ctx context.Context, cfg Config, enc *ffmpeglib.Encoder, c
 		if useHEVC {
 			err = encodeHEVC(ctx, enc, c.Path, outPath, hw, timeout, progress)
 		} else {
-			err = encodeAV1(ctx, enc, c.Path, outPath, timeout, progress)
+			err = encodeAV1(ctx, enc, c.Path, outPath, c.Size, c.Codec, timeout, progress)
 		}
 	}
 
@@ -420,7 +420,7 @@ func encodeRemote(ctx context.Context, cfg Config, enc *ffmpeglib.Encoder, c sca
 	if useHEVC {
 		err = encodeHEVC(ctx, enc, localIn, localOut, hw, timeout, progress)
 	} else {
-		err = encodeAV1(ctx, enc, localIn, localOut, timeout, progress)
+		err = encodeAV1(ctx, enc, localIn, localOut, c.Size, c.Codec, timeout, progress)
 	}
 	if err != nil {
 		if job != nil {
@@ -511,7 +511,7 @@ func isHighBitDepth(pixFmt string) bool {
 	return strings.Contains(pixFmt, "10") || strings.Contains(pixFmt, "12")
 }
 
-func encodeAV1(ctx context.Context, enc *ffmpeglib.Encoder, inPath, outPath string, timeout time.Duration, progress func(ffmpeglib.ProgressLine)) error {
+func encodeAV1(ctx context.Context, enc *ffmpeglib.Encoder, inPath, outPath string, inputSize int64, fromCodec string, timeout time.Duration, progress func(ffmpeglib.ProgressLine)) error {
 	log.Printf("AV1 sw encode %s -> %s", inPath, outPath)
 
 	pixFmt := "yuv420p10le"
@@ -519,18 +519,28 @@ func encodeAV1(ctx context.Context, enc *ffmpeglib.Encoder, inPath, outPath stri
 		pixFmt = "yuv420p"
 	}
 
+	dur, err := enc.DurationSeconds(ctx, inPath)
+	if err != nil || dur <= 0 {
+		return fmt.Errorf("cannot get duration for VBR target: %w", err)
+	}
+	totalKbps := float64(inputSize*8) / dur / 1000
+	targetKbps := int64(totalKbps * 0.90)
+	if targetKbps < 100 {
+		return fmt.Errorf("source bitrate too low for VBR target (%d kbps)", targetKbps)
+	}
+
 	opts := ffmpeglib.AV1Options{
-		CRF:              30,
-		Preset:           5,
-		Threads:          encodeThreads(),
-		SkipIfAlreadyAV1: true,
-		Container:        "mkv",
-		PixFmt:           pixFmt,
-		MetaComment:      paths.MetaComment,
+		Preset:            5,
+		Threads:           encodeThreads(),
+		TargetBitrateKbps: targetKbps,
+		SkipIfAlreadyAV1:  fromCodec != "flicksqueeze", // re-encode our own AV1 outputs
+		Container:         "mkv",
+		PixFmt:            pixFmt,
+		MetaComment:       paths.MetaComment,
 	}
 
 	encCtx, encCancel := context.WithTimeout(ctx, timeout)
-	err := enc.EncodeToAV1SVT(encCtx, inPath, outPath, opts, progress)
+	err = enc.EncodeToAV1SVT(encCtx, inPath, outPath, opts, progress)
 	encCancel()
 
 	if err != nil && !errors.Is(err, ffmpeglib.ErrAlreadyAV1) && ctx.Err() == nil {

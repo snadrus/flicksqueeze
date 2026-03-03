@@ -169,7 +169,7 @@ All settings are compiled in. Key values:
 
 | Setting | Value | Source |
 |---------|-------|--------|
-| AV1 CRF | 30 | `internal/flsq/flsq.go` |
+| AV1 mode | VBR 90% of source bitrate | `internal/flsq/flsq.go` |
 | AV1 preset | 5 | `internal/flsq/flsq.go` |
 | HEVC CQ/QP | 18 | `internal/ffmpeglib/ffmpeg_adapter.go` |
 | Min file size | 10 MB | `internal/paths/paths.go` |
