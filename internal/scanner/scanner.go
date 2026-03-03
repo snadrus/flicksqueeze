@@ -56,6 +56,7 @@ var codecSavings = map[string]float64{
 	"h264":       0.32,  // tally
 	"hevc":       0.35,  // tally
 	"vp9":        0.23,
+	"flicksqueeze": 0.10, // our AV1 outputs; re-encode with VBR 90% for ~10% savings
 }
 
 type Candidate struct {
@@ -154,10 +155,10 @@ func Scan(ctx context.Context, fsys vfs.FS, enc *ffmpeglib.Encoder, rootPath str
 
 		if hit {
 			writer.write(path, cachedCodec, mod, sz)
-			if sz < paths.MinSize || mod.After(cutoff) || cachedCodec == "X" || cachedCodec == "av1" || cachedCodec == "flicksqueeze" {
+			if sz < paths.MinSize || mod.After(cutoff) || cachedCodec == "X" || cachedCodec == "av1" {
 				return nil
 			}
-			if outputExists(fsys, path) {
+			if cachedCodec != "flicksqueeze" && outputExists(fsys, path) {
 				return nil
 			}
 			enqueue(path, cachedCodec, sz)
@@ -182,9 +183,13 @@ func Scan(ctx context.Context, fsys vfs.FS, enc *ffmpeglib.Encoder, rootPath str
 				codec = "flicksqueeze"
 			}
 			writer.write(path, codec, mod, sz)
-			return nil
+			if codec == "av1" {
+				return nil // not ours, skip
+			}
+			// flicksqueeze: fall through to enqueue
+		} else {
+			writer.write(path, codec, mod, sz)
 		}
-		writer.write(path, codec, mod, sz)
 		if outputExists(fsys, path) {
 			return nil
 		}

@@ -43,6 +43,9 @@ type AV1Options struct {
 	Container   string
 	MetaComment string
 
+	// TargetBitrateKbps: when set, use VBR (rc=1) instead of CRF. Encoder allocates bits across scenes.
+	TargetBitrateKbps int64
+
 	SkipIfAlreadyAV1 bool
 	DropSubtitles    bool
 	ExtraFFmpegArgs  []string
@@ -103,12 +106,15 @@ func (e *Encoder) EncodeToAV1SVT(ctx context.Context, inPath, outPath string, op
 		"-i", inPath,
 		"-map", "0:v", "-map", "0:a?",
 		"-c:v", "libsvtav1",
-		"-crf", strconv.Itoa(opt.CRF),
 		"-preset", strconv.Itoa(opt.Preset),
 		"-pix_fmt", opt.PixFmt,
 		"-g", "240",
 		"-c:a", "copy",
 	}
+	if opt.TargetBitrateKbps <= 0 {
+		return fmt.Errorf("VBR required: TargetBitrateKbps must be set")
+	}
+	args = append(args, "-svtav1-params", "rc=1:tbr="+strconv.FormatInt(opt.TargetBitrateKbps, 10))
 
 	if opt.DropSubtitles {
 		args = append(args, "-sn")
