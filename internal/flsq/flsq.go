@@ -55,17 +55,18 @@ type remoteUploadJob struct {
 // status tracks what the converter is doing so the interactive console
 // can report it on demand.
 type status struct {
-	mu          sync.Mutex
+	mu           sync.Mutex
 	sessionStart time.Time
-	file        string
-	size        int64
-	codec       string
-	encType     string
-	startedAt   time.Time
-	ffmpegTime  string // latest time= from ffmpeg progress
-	ffmpegSpd   string // latest speed= from ffmpeg progress
-	filesTotal  int
-	bytesSaved  int64
+	file         string
+	size         int64
+	codec        string
+	encType      string
+	startedAt    time.Time
+	ffmpegTime   string // latest time= from ffmpeg progress
+	ffmpegSpd    string // latest speed= from ffmpeg progress
+	filesTotal   int
+	bytesSaved   int64
+	idleReason   string // "scanning" or "waiting" when file==""
 }
 
 func (s *status) startEncode(path, codec, encType string, size int64) {
@@ -102,6 +103,12 @@ func (s *status) finishEncode(saved int64) {
 	s.file = ""
 }
 
+func (s *status) setIdleReason(reason string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.idleReason = reason
+}
+
 func (s *status) print() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -116,7 +123,11 @@ func (s *status) print() {
 			fmt.Fprintf(os.Stderr, "  progress: time=%s speed=%s\n", s.ffmpegTime, s.ffmpegSpd)
 		}
 	} else {
-		fmt.Fprintln(os.Stderr, "  idle (scanning or waiting)")
+		reason := s.idleReason
+		if reason == "" {
+			reason = "waiting"
+		}
+		fmt.Fprintf(os.Stderr, "  idle (%s)\n", reason)
 	}
 	sessionHours := time.Since(s.sessionStart).Hours()
 	fmt.Fprintf(os.Stderr, "  session: %d files converted, %s saved", s.filesTotal, scanner.HumanSize(s.bytesSaved))
@@ -207,8 +218,10 @@ func Run(ctx context.Context, cfg Config) error {
 
 	for {
 		ch := make(chan scanner.Candidate)
-		go scanner.Scan(scanCtx, cfg.FS, enc, cfg.RootPath, ch)
+		metaCh := make(chan scanner.ScanMeta, 1)
+		go scanner.Scan(scanCtx, cfg.FS, enc, cfg.RootPath, ch, metaCh)
 		log.Println("scanning for conversion candidates...")
+		st.setIdleReason("scanning")
 
 		var uploadChan chan remoteUploadJob
 		var uploadWg sync.WaitGroup
@@ -254,11 +267,23 @@ func Run(ctx context.Context, cfg Config) error {
 			return nil
 		}
 
-		if processed == 0 {
+		// Get scan meta (more=true means rescan might find work—skip wait)
+		meta := scanner.ScanMeta{More: false}
+		select {
+		case m := <-metaCh:
+			meta = m
+		case <-scanCtx.Done():
+			// scan cancelled, don't block
+		}
+
+		st.setIdleReason("waiting")
+		if processed == 0 && !meta.More {
 			log.Println("no conversion candidates found, rescanning in", idleRescanSleep)
 			if !sleepCtx(scanCtx, idleRescanSleep) {
 				return nil
 			}
+		} else if processed == 0 && meta.More {
+			log.Println("no conversion candidates (some skipped), rescanning immediately")
 		}
 	}
 }

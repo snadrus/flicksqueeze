@@ -65,6 +65,12 @@ type Candidate struct {
 	WasteScore float64
 }
 
+// ScanMeta is sent when a scan completes. More=true means some files were
+// skipped (locked, probe failed) so a rescan might find work—don't wait.
+type ScanMeta struct {
+	More bool
+}
+
 // savingsRatio returns expected savings [0,1]. Tally overrides codecSavings when present.
 func savingsRatio(codec string, tally map[string]float64) float64 {
 	c := strings.ToLower(codec)
@@ -79,8 +85,9 @@ func savingsRatio(codec string, tally map[string]float64) float64 {
 	return 0.50 // unknown codec
 }
 
-// Scan walks rootPath, streaming up to MaxCandidates candidates on out.
-func Scan(ctx context.Context, fsys vfs.FS, enc *ffmpeglib.Encoder, rootPath string, out chan<- Candidate) {
+// Scan walks rootPath, streaming candidates on out. When done, sends ScanMeta
+// on meta (More=true if files were skipped so a rescan might find work).
+func Scan(ctx context.Context, fsys vfs.FS, enc *ffmpeglib.Encoder, rootPath string, out chan<- Candidate, meta chan<- ScanMeta) {
 	defer close(out)
 
 	cutoff := time.Now().Add(-staleAge)
@@ -94,12 +101,18 @@ func Scan(ctx context.Context, fsys vfs.FS, enc *ffmpeglib.Encoder, rootPath str
 	writer, err := openWriter(fsys, newPath)
 	if err != nil {
 		log.Printf("scan: cannot create index %s: %v", newPath, err)
+		if meta != nil {
+			meta <- ScanMeta{More: true}
+			close(meta)
+		}
 		return
 	}
 
 	var buf []Candidate
 	scanned := 0
 	writerOK := true
+	hadLocked := false
+	hadProbeFail := false
 
 	enqueue := func(path, codec string, sz int64) {
 		savings := savingsRatio(codec, tally)
@@ -140,6 +153,7 @@ func Scan(ctx context.Context, fsys vfs.FS, enc *ffmpeglib.Encoder, rootPath str
 			return nil
 		}
 		if isLocked(fsys, path) {
+			hadLocked = true
 			return nil
 		}
 
@@ -171,6 +185,7 @@ func Scan(ctx context.Context, fsys vfs.FS, enc *ffmpeglib.Encoder, rootPath str
 		probed, err := enc.VideoCodec(ctx, path)
 		if err != nil {
 			log.Printf("scan: skipping %s (probe failed: %v)", path, err)
+			hadProbeFail = true
 			writer.write(path, "X", mod, sz)
 			return nil
 		}
@@ -204,6 +219,10 @@ func Scan(ctx context.Context, fsys vfs.FS, enc *ffmpeglib.Encoder, rootPath str
 		log.Println("scan interrupted, keeping previous index")
 	}
 
+	if meta != nil {
+		meta <- ScanMeta{More: hadLocked || hadProbeFail}
+		close(meta)
+	}
 	log.Printf("scan complete: %d conversion candidates evaluated", scanned)
 }
 
