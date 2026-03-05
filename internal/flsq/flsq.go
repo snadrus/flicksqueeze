@@ -34,9 +34,10 @@ const (
 type Config struct {
 	RootPath    string
 	NoDelete    bool
+	Verbose     bool // log why each file is skipped during scan
 	FS          vfs.FS
 	UploadQueue chan<- remoteUploadJob // when set, remote encodes queue uploads instead of blocking
-	UploadWg    *sync.WaitGroup        // incremented per queued upload; wait before exit
+	UploadWg    *sync.WaitGroup       // incremented per queued upload; wait before exit
 }
 
 // remoteUploadJob is sent to the upload worker after a remote encode completes.
@@ -55,18 +56,17 @@ type remoteUploadJob struct {
 // status tracks what the converter is doing so the interactive console
 // can report it on demand.
 type status struct {
-	mu           sync.Mutex
+	mu          sync.Mutex
 	sessionStart time.Time
-	file         string
-	size         int64
-	codec        string
-	encType      string
-	startedAt    time.Time
-	ffmpegTime   string // latest time= from ffmpeg progress
-	ffmpegSpd    string // latest speed= from ffmpeg progress
-	filesTotal   int
-	bytesSaved   int64
-	idleReason   string // "scanning" or "waiting" when file==""
+	file        string
+	size        int64
+	codec       string
+	encType     string
+	startedAt   time.Time
+	ffmpegTime  string // latest time= from ffmpeg progress
+	ffmpegSpd   string // latest speed= from ffmpeg progress
+	filesTotal  int
+	bytesSaved  int64
 }
 
 func (s *status) startEncode(path, codec, encType string, size int64) {
@@ -103,12 +103,6 @@ func (s *status) finishEncode(saved int64) {
 	s.file = ""
 }
 
-func (s *status) setIdleReason(reason string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.idleReason = reason
-}
-
 func (s *status) print() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -123,11 +117,7 @@ func (s *status) print() {
 			fmt.Fprintf(os.Stderr, "  progress: time=%s speed=%s\n", s.ffmpegTime, s.ffmpegSpd)
 		}
 	} else {
-		reason := s.idleReason
-		if reason == "" {
-			reason = "waiting"
-		}
-		fmt.Fprintf(os.Stderr, "  idle (%s)\n", reason)
+		fmt.Fprintln(os.Stderr, "  idle (scanning or waiting)")
 	}
 	sessionHours := time.Since(s.sessionStart).Hours()
 	fmt.Fprintf(os.Stderr, "  session: %d files converted, %s saved", s.filesTotal, scanner.HumanSize(s.bytesSaved))
@@ -218,10 +208,8 @@ func Run(ctx context.Context, cfg Config) error {
 
 	for {
 		ch := make(chan scanner.Candidate)
-		metaCh := make(chan scanner.ScanMeta, 1)
-		go scanner.Scan(scanCtx, cfg.FS, enc, cfg.RootPath, ch, metaCh)
+		go scanner.Scan(scanCtx, cfg.FS, enc, cfg.RootPath, ch, cfg.Verbose)
 		log.Println("scanning for conversion candidates...")
-		st.setIdleReason("scanning")
 
 		var uploadChan chan remoteUploadJob
 		var uploadWg sync.WaitGroup
@@ -243,10 +231,11 @@ func Run(ctx context.Context, cfg Config) error {
 				}
 				return nil
 			}
-			processed++
-			log.Printf("candidate %d: [%s] %s (%s, codec=%s)",
-				processed, scanner.HumanSize(c.Size), c.Path, fmtWaste(c.WasteScore), c.Codec)
-			processCandidate(ctx, cfg, enc, c, hw, &st)
+			log.Printf("candidate: [%s] %s (%s, codec=%s)",
+				scanner.HumanSize(c.Size), c.Path, fmtWaste(c.WasteScore), c.Codec)
+			if processCandidate(ctx, cfg, enc, c, hw, &st) {
+				processed++
+			}
 			if scanCtx.Err() != nil {
 				for range ch {
 				}
@@ -267,23 +256,11 @@ func Run(ctx context.Context, cfg Config) error {
 			return nil
 		}
 
-		// Get scan meta (more=true means rescan might find work—skip wait)
-		meta := scanner.ScanMeta{More: false}
-		select {
-		case m := <-metaCh:
-			meta = m
-		case <-scanCtx.Done():
-			// scan cancelled, don't block
-		}
-
-		st.setIdleReason("waiting")
-		if processed == 0 && !meta.More {
+		if processed == 0 {
 			log.Println("no conversion candidates found, rescanning in", idleRescanSleep)
 			if !sleepCtx(scanCtx, idleRescanSleep) {
 				return nil
 			}
-		} else if processed == 0 && meta.More {
-			log.Println("no conversion candidates (some skipped), rescanning immediately")
 		}
 	}
 }
@@ -294,13 +271,14 @@ var hevcFirstCodecs = map[string]bool{
 	"wmv1": true, "wmv2": true, "wmv3": true, "vp8": true,
 }
 
-func processCandidate(ctx context.Context, cfg Config, enc *ffmpeglib.Encoder, c scanner.Candidate, hw ffmpeglib.HWCaps, st *status) {
+// processCandidate returns true if it converted (or queued) a file, false if it skipped.
+func processCandidate(ctx context.Context, cfg Config, enc *ffmpeglib.Encoder, c scanner.Candidate, hw ffmpeglib.HWCaps, st *status) bool {
 	fsys := cfg.FS
 	timeout := encodeTimeoutForSize(c.Size)
 	release, err := acquireLock(fsys, c.Path, timeout)
 	if err != nil {
 		log.Printf("skipping %s: %v", c.Path, err)
-		return
+		return false
 	}
 	defer release()
 
@@ -308,11 +286,11 @@ func processCandidate(ctx context.Context, cfg Config, enc *ffmpeglib.Encoder, c
 	info, err := fsys.Stat(c.Path)
 	if err != nil {
 		log.Printf("skipping %s: file no longer exists", c.Path)
-		return
+		return false
 	}
 	if info.Size() != c.Size {
 		log.Printf("skipping %s: size changed since scan (%d -> %d)", c.Path, c.Size, info.Size())
-		return
+		return false
 	}
 
 	outPath := paths.OutputPath(c.Path)
@@ -322,7 +300,7 @@ func processCandidate(ctx context.Context, cfg Config, enc *ffmpeglib.Encoder, c
 		comment, _ := enc.Comment(ctx, outPath)
 		if !paths.IsOurComment(comment) {
 			log.Printf("skipping %s: output %s already exists (not ours)", c.Path, outPath)
-			return
+			return false
 		}
 		if err := validator.Validate(ctx, fsys, enc, c.Path, outPath, c.Size); err == nil {
 			log.Printf("restart recovery: %s already converted, finishing up", c.Path)
@@ -332,7 +310,7 @@ func processCandidate(ctx context.Context, cfg Config, enc *ffmpeglib.Encoder, c
 				encType = "hevc"
 			}
 			finishConversion(fsys, c, outPath, cfg.RootPath, cfg.NoDelete, encType, st)
-			return
+			return true
 		}
 		log.Printf("stale output %s from previous failed run, removing", outPath)
 		_ = fsys.Remove(outPath)
@@ -359,7 +337,7 @@ func processCandidate(ctx context.Context, cfg Config, enc *ffmpeglib.Encoder, c
 		if useHEVC {
 			err = encodeHEVC(ctx, enc, c.Path, outPath, hw, timeout, progress)
 		} else {
-			err = encodeAV1(ctx, enc, c.Path, outPath, c.Size, c.Codec, timeout, progress)
+			err = encodeAV1(ctx, enc, c.Path, outPath, timeout, progress)
 		}
 	}
 
@@ -369,14 +347,14 @@ func processCandidate(ctx context.Context, cfg Config, enc *ffmpeglib.Encoder, c
 		if ctx.Err() == nil {
 			scanner.MarkFailed(fsys, cfg.RootPath, c.Path)
 		}
-		return
+		return false
 	}
 
 	// --- remote async: upload runs in worker so next download can start immediately ---
 	if fsys.IsRemote() && cfg.UploadQueue != nil && queuedJob != nil {
 		cfg.UploadWg.Add(1)
 		cfg.UploadQueue <- *queuedJob
-		return
+		return true
 	}
 
 	// --- validate (probes run where files live) ---
@@ -386,10 +364,11 @@ func processCandidate(ctx context.Context, cfg Config, enc *ffmpeglib.Encoder, c
 		if ctx.Err() == nil {
 			scanner.MarkFailed(fsys, cfg.RootPath, c.Path)
 		}
-		return
+		return false
 	}
 
 	finishConversion(fsys, c, outPath, cfg.RootPath, cfg.NoDelete, encType, st)
+	return true
 }
 
 // encodeRemote downloads the source, encodes locally, and optionally uploads (sync) or fills job for async upload.
@@ -420,7 +399,7 @@ func encodeRemote(ctx context.Context, cfg Config, enc *ffmpeglib.Encoder, c sca
 	if useHEVC {
 		err = encodeHEVC(ctx, enc, localIn, localOut, hw, timeout, progress)
 	} else {
-		err = encodeAV1(ctx, enc, localIn, localOut, c.Size, c.Codec, timeout, progress)
+		err = encodeAV1(ctx, enc, localIn, localOut, timeout, progress)
 	}
 	if err != nil {
 		if job != nil {
@@ -511,7 +490,7 @@ func isHighBitDepth(pixFmt string) bool {
 	return strings.Contains(pixFmt, "10") || strings.Contains(pixFmt, "12")
 }
 
-func encodeAV1(ctx context.Context, enc *ffmpeglib.Encoder, inPath, outPath string, inputSize int64, fromCodec string, timeout time.Duration, progress func(ffmpeglib.ProgressLine)) error {
+func encodeAV1(ctx context.Context, enc *ffmpeglib.Encoder, inPath, outPath string, timeout time.Duration, progress func(ffmpeglib.ProgressLine)) error {
 	log.Printf("AV1 sw encode %s -> %s", inPath, outPath)
 
 	pixFmt := "yuv420p10le"
@@ -519,28 +498,18 @@ func encodeAV1(ctx context.Context, enc *ffmpeglib.Encoder, inPath, outPath stri
 		pixFmt = "yuv420p"
 	}
 
-	dur, err := enc.DurationSeconds(ctx, inPath)
-	if err != nil || dur <= 0 {
-		return fmt.Errorf("cannot get duration for VBR target: %w", err)
-	}
-	totalKbps := float64(inputSize*8) / dur / 1000
-	targetKbps := int64(totalKbps * 0.90)
-	if targetKbps < 100 {
-		return fmt.Errorf("source bitrate too low for VBR target (%d kbps)", targetKbps)
-	}
-
 	opts := ffmpeglib.AV1Options{
-		Preset:            5,
-		Threads:           encodeThreads(),
-		TargetBitrateKbps: targetKbps,
-		SkipIfAlreadyAV1:  fromCodec != "flicksqueeze", // re-encode our own AV1 outputs
-		Container:         "mkv",
-		PixFmt:            pixFmt,
-		MetaComment:       paths.MetaComment,
+		CRF:              30,
+		Preset:           5,
+		Threads:          encodeThreads(),
+		SkipIfAlreadyAV1: true,
+		Container:        "mkv",
+		PixFmt:           pixFmt,
+		MetaComment:      paths.MetaComment,
 	}
 
 	encCtx, encCancel := context.WithTimeout(ctx, timeout)
-	err = enc.EncodeToAV1SVT(encCtx, inPath, outPath, opts, progress)
+	err := enc.EncodeToAV1SVT(encCtx, inPath, outPath, opts, progress)
 	encCancel()
 
 	if err != nil && !errors.Is(err, ffmpeglib.ErrAlreadyAV1) && ctx.Err() == nil {

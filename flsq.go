@@ -30,6 +30,8 @@ func main() {
 		switch args[0] {
 		case "--no-delete":
 			cfg.NoDelete = true
+		case "--verbose":
+			cfg.Verbose = true
 		case "--version", "-v":
 			fmt.Printf("flicksqueeze %s (commit %s, built %s)\n", version, commit, buildDate)
 			return
@@ -106,6 +108,7 @@ func printHelp() {
 	fmt.Println()
 	fmt.Println("FLAGS")
 	fmt.Println("  --no-delete   Keep originals (renamed with _deleteMe suffix)")
+	fmt.Println("  --verbose     Log why each file is skipped during scan")
 	fmt.Println("  --version     Print version and exit")
 	fmt.Println()
 	fmt.Println("EXAMPLES")

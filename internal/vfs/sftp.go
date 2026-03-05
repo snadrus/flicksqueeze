@@ -27,7 +27,7 @@ type SFTP struct {
 
 // DialSSH parses an ssh:// URL, connects, and returns the FS and remote root path.
 // Format: ssh://user@host[:port]/path
-// Tries SSH agent first, then prompts for a password.
+// Prompts for password first (prompt appears promptly), then tries SSH agent.
 func DialSSH(rawURL string) (*SFTP, string, error) {
 	u, err := url.Parse(rawURL)
 	if err != nil {
@@ -53,18 +53,19 @@ func DialSSH(rawURL string) (*SFTP, string, error) {
 
 	var authMethods []ssh.AuthMethod
 
-	if sock := os.Getenv("SSH_AUTH_SOCK"); sock != "" {
-		if conn, err := net.Dial("unix", sock); err == nil {
-			authMethods = append(authMethods, ssh.PublicKeysCallback(agent.NewClient(conn).Signers))
-		}
-	}
-
+	// Password first so prompt appears promptly; agent as fallback for key users.
 	authMethods = append(authMethods, ssh.PasswordCallback(func() (string, error) {
 		fmt.Fprintf(os.Stderr, "Password for %s@%s: ", user, host)
 		pw, err := term.ReadPassword(int(os.Stdin.Fd()))
 		fmt.Fprintln(os.Stderr)
 		return string(pw), err
 	}))
+
+	if sock := os.Getenv("SSH_AUTH_SOCK"); sock != "" {
+		if conn, err := net.Dial("unix", sock); err == nil {
+			authMethods = append(authMethods, ssh.PublicKeysCallback(agent.NewClient(conn).Signers))
+		}
+	}
 
 	config := &ssh.ClientConfig{
 		User:            user,

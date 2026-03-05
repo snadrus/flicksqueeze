@@ -56,7 +56,6 @@ var codecSavings = map[string]float64{
 	"h264":       0.32,  // tally
 	"hevc":       0.35,  // tally
 	"vp9":        0.23,
-	"flicksqueeze": 0.10, // our AV1 outputs; re-encode with VBR 90% for ~10% savings
 }
 
 type Candidate struct {
@@ -64,12 +63,6 @@ type Candidate struct {
 	Size       int64
 	Codec      string
 	WasteScore float64
-}
-
-// ScanMeta is sent when a scan completes. More=true means some files were
-// skipped (locked, probe failed) so a rescan might find work—don't wait.
-type ScanMeta struct {
-	More bool
 }
 
 // savingsRatio returns expected savings [0,1]. Tally overrides codecSavings when present.
@@ -86,10 +79,16 @@ func savingsRatio(codec string, tally map[string]float64) float64 {
 	return 0.50 // unknown codec
 }
 
-// Scan walks rootPath, streaming candidates on out. When done, sends ScanMeta
-// on meta (More=true if files were skipped so a rescan might find work).
-func Scan(ctx context.Context, fsys vfs.FS, enc *ffmpeglib.Encoder, rootPath string, out chan<- Candidate, meta chan<- ScanMeta) {
+// Scan walks rootPath, streaming up to MaxCandidates candidates on out.
+// If verbose is true, logs why each skipped file is excluded.
+func Scan(ctx context.Context, fsys vfs.FS, enc *ffmpeglib.Encoder, rootPath string, out chan<- Candidate, verbose bool) {
 	defer close(out)
+
+	skipLog := func(path, reason string) {
+		if verbose {
+			log.Printf("scan: skipping %s (%s)", path, reason)
+		}
+	}
 
 	cutoff := time.Now().Add(-staleAge)
 	failures := LoadFailures(fsys, rootPath)
@@ -102,18 +101,12 @@ func Scan(ctx context.Context, fsys vfs.FS, enc *ffmpeglib.Encoder, rootPath str
 	writer, err := openWriter(fsys, newPath)
 	if err != nil {
 		log.Printf("scan: cannot create index %s: %v", newPath, err)
-		if meta != nil {
-			meta <- ScanMeta{More: true}
-			close(meta)
-		}
 		return
 	}
 
 	var buf []Candidate
 	scanned := 0
 	writerOK := true
-	hadLocked := false
-	hadProbeFail := false
 
 	enqueue := func(path, codec string, sz int64) {
 		savings := savingsRatio(codec, tally)
@@ -138,6 +131,7 @@ func Scan(ctx context.Context, fsys vfs.FS, enc *ffmpeglib.Encoder, rootPath str
 		}
 		if d.IsDir() {
 			if skipDirs[d.Name()] {
+				skipLog(path, "skip dir: "+d.Name())
 				return fs.SkipDir
 			}
 			return nil
@@ -148,13 +142,15 @@ func Scan(ctx context.Context, fsys vfs.FS, enc *ffmpeglib.Encoder, rootPath str
 			return nil
 		}
 		if paths.IsWorkFile(filepath.Base(path)) {
+			skipLog(path, "work file")
 			return nil
 		}
 		if failures[path] {
+			skipLog(path, "in failures list")
 			return nil
 		}
 		if isLocked(fsys, path) {
-			hadLocked = true
+			skipLog(path, "locked")
 			return nil
 		}
 
@@ -169,24 +165,42 @@ func Scan(ctx context.Context, fsys vfs.FS, enc *ffmpeglib.Encoder, rootPath str
 
 		if hit {
 			writer.write(path, cachedCodec, mod, sz)
-			if sz < paths.MinSize || mod.After(cutoff) || cachedCodec == "X" || cachedCodec == "av1" {
+			if sz < paths.MinSize {
+				skipLog(path, "cached: too small (<10MB)")
 				return nil
 			}
-			if cachedCodec != "flicksqueeze" && outputExists(fsys, path) {
+			if mod.After(cutoff) {
+				skipLog(path, "cached: modified in last 3 days")
+				return nil
+			}
+			if cachedCodec == "X" {
+				skipLog(path, "cached: probe failed previously")
+				return nil
+			}
+			if cachedCodec == "av1" || cachedCodec == "flicksqueeze" {
+				skipLog(path, "cached: already "+cachedCodec)
+				return nil
+			}
+			if outputExists(fsys, path) {
+				skipLog(path, "cached: output exists")
 				return nil
 			}
 			enqueue(path, cachedCodec, sz)
 			return nil
 		}
 
-		if sz < paths.MinSize || mod.After(cutoff) {
+		if sz < paths.MinSize {
+			skipLog(path, "too small (<10MB)")
+			return nil
+		}
+		if mod.After(cutoff) {
+			skipLog(path, "modified in last 3 days")
 			return nil
 		}
 
 		probed, err := enc.VideoCodec(ctx, path)
 		if err != nil {
 			log.Printf("scan: skipping %s (probe failed: %v)", path, err)
-			hadProbeFail = true
 			writer.write(path, "X", mod, sz)
 			return nil
 		}
@@ -198,14 +212,11 @@ func Scan(ctx context.Context, fsys vfs.FS, enc *ffmpeglib.Encoder, rootPath str
 				codec = "flicksqueeze"
 			}
 			writer.write(path, codec, mod, sz)
-			if codec == "av1" {
-				return nil // not ours, skip
-			}
-			// flicksqueeze: fall through to enqueue
-		} else {
-			writer.write(path, codec, mod, sz)
+			return nil
 		}
+		writer.write(path, codec, mod, sz)
 		if outputExists(fsys, path) {
+			skipLog(path, "output exists")
 			return nil
 		}
 		enqueue(path, codec, sz)
@@ -224,10 +235,6 @@ func Scan(ctx context.Context, fsys vfs.FS, enc *ffmpeglib.Encoder, rootPath str
 		log.Println("scan interrupted, keeping previous index")
 	}
 
-	if meta != nil {
-		meta <- ScanMeta{More: hadLocked || hadProbeFail}
-		close(meta)
-	}
 	log.Printf("scan complete: %d conversion candidates evaluated", scanned)
 }
 
